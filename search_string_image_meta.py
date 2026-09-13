@@ -53,6 +53,9 @@ Examples
     # the final prompt a save node stored (say, one an LLM wrote), not the graph
     python3 search_string_image_meta.py ~/output "lighthouse" -r --saved-prompts prompt
 
+    # ...or only in some of the stored intermediate prompts
+    python3 search_string_image_meta.py ~/output "lighthouse" -r --saved-prompts intermediate1 intermediate2
+
     # only the ComfyUI graph chunks, only PNGs, exact case
     python3 search_string_image_meta.py ~/output "LoRA" -r -s --fields prompt workflow --ext png
 
@@ -1031,6 +1034,36 @@ def _prompt_record(data) -> list:
     return found
 
 
+_SAVED_ALIASES = {"prompt": "prompt", "positive": "prompt",
+                  "positiveprompt": "prompt", "negative": "negative",
+                  "negativeprompt": "negative"}
+
+
+def saved_prompt_kind(value: str) -> str:
+    """argparse type for --saved-prompts: prompt, negative, intermediate, or
+    one intermediate by number (intermediate2). Long field names such as
+    negative_prompt or intermediate_prompt_2 work too."""
+    token = value.strip().lower().replace("_", "").replace("-", "")
+    if token in _SAVED_ALIASES:
+        return _SAVED_ALIASES[token]
+    number = re.fullmatch(r"intermediate(?:prompt)?(\d*)", token)
+    if number:
+        return "intermediate" + (str(int(number.group(1))) if number.group(1) else "")
+    raise argparse.ArgumentTypeError(
+        f"{value!r} isn't a saved prompt: use prompt, negative, intermediate, "
+        f"or one intermediate such as intermediate1")
+
+
+def _saved_wanted(kind: str, key: str, wanted) -> bool:
+    """Whether a stored prompt is among the kinds --saved-prompts asked for."""
+    if kind in wanted:
+        return True
+    if kind == "intermediate":
+        number = re.search(r"(\d+)$", key)
+        return bool(number) and f"intermediate{int(number.group(1))}" in wanted
+    return False
+
+
 def saved_prompts(meta: dict) -> list:
     """The prompts a save node stored itself, as [(field, key, kind, text)].
 
@@ -1313,7 +1346,8 @@ def _worker_init(opts: dict):
     cfg["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
     saved = opts.get("saved_prompts")  # None, or the kinds to search
     cfg["saved"] = (None if saved is None
-                    else set(saved) or {"prompt", "negative", "intermediate"})
+                    else frozenset(saved)
+                    or frozenset({"prompt", "negative", "intermediate"}))
     cfg["fields"] = ({f.lower() for f in opts["fields"]}
                      if opts["fields"] else None)
 
@@ -1371,7 +1405,8 @@ def scan_one(path_str: str):
     if cfg["saved"] is not None:
         # --saved-prompts: every stored prompt is a unit of its own
         for field, key, kind, text in saved_prompts(meta):
-            if kind in cfg["saved"] and not (only and field.lower() not in only):
+            if (_saved_wanted(kind, key, cfg["saved"])
+                    and not (only and field.lower() not in only)):
                 units.append((f"{field}:{key}",
                               prepare_text(text) if cfg["unicode"] else text))
     else:
@@ -2096,13 +2131,14 @@ def parse_args(argv=None):
                          "newer ComfyUI frontends. Metadata that isn't a "
                          "ComfyUI graph is skipped")
     ap.add_argument("--saved-prompts", nargs="*", metavar="KIND",
-                    choices=["prompt", "negative", "intermediate"],
+                    type=saved_prompt_kind,
                     help="only search the prompts a save node stored itself "
                          "(a JSON record such as MetaWriter's gen_meta, or "
                          "A1111-style parameters), which hold the final text "
                          "even when an LLM or a wildcard wrote it. Optionally "
-                         "only some kinds: prompt, negative, intermediate. Put "
-                         "it after the search patterns")
+                         "only some of them: prompt, negative, intermediate "
+                         "(all), or intermediate1, intermediate2, … Put it "
+                         "after the search patterns")
     ap.add_argument("-r", "--recursive", action="store_true",
                     help="descend into subfolders (default: top level only)")
     ap.add_argument("-j", "--workers", type=int, default=0, metavar="N",

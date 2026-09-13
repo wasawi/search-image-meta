@@ -161,8 +161,9 @@ and `intermediate_prompt_1`–`3` (MetaWriter's `gen_meta`, older `request` /
 `raw.meta` shapes, also inside a JPEG's EXIF comment), or A1111-style
 `parameters`.
 
-- `--saved-prompts` searches only those stored prompts; add `prompt`,
-  `negative` or `intermediate` to pick which. Each one counts as its own field,
+- `--saved-prompts` searches only those stored prompts. Pick any of them:
+  `prompt`, `negative`, `intermediate` (all of them), or single ones such as
+  `intermediate1 intermediate3`. Each stored prompt counts as its own field,
   so `--scope field` means "in the same prompt".
 - `--show` uses them for the positive, negative and intermediate prompts, and
   says where they came from (`prompt_source` in `--json`).

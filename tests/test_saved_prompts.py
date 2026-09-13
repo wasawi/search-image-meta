@@ -124,6 +124,37 @@ def test_choosing_which_prompts(saved_dir):
                                 "prompt", "negative")) == set()
 
 
+def test_choosing_single_intermediate_prompts(saved_dir):
+    # DRAFT_one is intermediate_prompt_1, DRAFT_two is intermediate_prompt_2
+    assert hit_names(run_search(saved_dir, "DRAFT_one", "--saved-prompts",
+                                "intermediate1")) == {"metawriter.png"}
+    assert hit_names(run_search(saved_dir, "DRAFT_one", "--saved-prompts",
+                                "intermediate2")) == set()
+    assert hit_names(run_search(saved_dir, "DRAFT_one", "--saved-prompts",
+                                "intermediate2", "intermediate3")) == set()
+    report = run_search(saved_dir, "DRAFT", "--saved-prompts", "intermediate1",
+                        "intermediate2", "--scope", "field")
+    assert fields_by_file(report) == {"metawriter.png": [
+        "gen_meta:intermediate_prompt_1", "gen_meta:intermediate_prompt_2"]}
+    report = run_search(saved_dir, "DRAFT", "--saved-prompts", "prompt",
+                        "intermediate2", "--scope", "field")
+    assert fields_by_file(report) == {"metawriter.png": ["gen_meta:intermediate_prompt_2"]}
+
+
+def test_long_field_names_are_accepted(saved_dir):
+    assert hit_names(run_search(saved_dir, "DRAFT_two", "--saved-prompts",
+                                "intermediate_prompt_2")) == {"metawriter.png"}
+    assert hit_names(run_search(saved_dir, "NEG_saved", "--saved-prompts",
+                                "negative_prompt")) == {"metawriter.png"}
+    assert hit_names(run_search(saved_dir, "FINAL_llm_prompt", "--saved-prompts",
+                                "Positive")) == {"metawriter.png"}
+
+
+def test_unknown_saved_prompt_is_a_usage_error(saved_dir):
+    code, _out, err = run_cli(saved_dir, "x", "--saved-prompts", "intermediate_x")
+    assert code == 2 and "isn't a saved prompt" in err
+
+
 def test_labels_name_the_record_and_pin(saved_dir):
     report = run_search(saved_dir, "DRAFT", "--saved-prompts", "--scope", "field")
     assert fields_by_file(report) == {"metawriter.png": [
