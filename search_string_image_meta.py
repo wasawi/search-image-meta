@@ -22,6 +22,9 @@ Examples
     # either one is enough
     python3 search_string_image_meta.py ~/output "Barcelona" "Girona" -r --any
 
+    # Barcelona, but not the images that also mention sunset or night
+    python3 search_string_image_meta.py ~/output "Barcelona" -r --not "sunset" "night"
+
     # regex + symlinks to the matches, 24 workers
     python3 search_string_image_meta.py ~/output "wan.?2\\.2" -r --regex --link-dir ~/matches -j 24
 
@@ -545,7 +548,7 @@ def _graph_nodes(graph: dict, kind: str) -> list:
 
 
 def search_units(field: str, text: str, rxs, mode: str, scope: str,
-                 connected) -> list:
+                 connected, not_rxs=()) -> list:
     """Split one metadata field into the (label, text) units to match against.
 
     Normally that's the field itself. When it holds a ComfyUI graph:
@@ -565,10 +568,12 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
         return [(field, text)]
 
     # dropping or splitting up nodes can only lose matches: if the graph as a
-    # whole can't match, there is nothing to find and no JSON to parse
+    # whole can't match, there is nothing to find (or to exclude with --not)
+    # and no JSON to parse
     found = [rx.search(text) for rx in rxs]
     need_all = mode == "all" and scope != "image"
-    if not (all(found) if need_all else any(found)):
+    if (not (all(found) if need_all else any(found))
+            and not any(n.search(text) for n in not_rxs)):
         return []
 
     try:
@@ -641,16 +646,21 @@ _CFG: dict = {}  # per-worker state, set by _worker_init
 def _worker_init(opts: dict):
     """Set up a worker from the options main() collected.
 
-    patterns, regex, case_sensitive, fields, snippets, deep, mode ("all" /
-    "any"), scope ("image" / "field" / "node"), connected (None / "linked" /
-    "output").
+    patterns, exclude, regex, case_sensitive, fields, snippets, deep, mode
+    ("all" / "any"), scope ("image" / "field" / "node"), connected (None /
+    "linked" / "output").
     """
     flags = (0 if opts["case_sensitive"] else re.IGNORECASE) | re.DOTALL
+
+    def compile_all(patterns):
+        patterns = (unicodedata.normalize("NFC", p) for p in patterns or ())
+        return [re.compile(p if opts["regex"] else re.escape(p), flags)
+                for p in patterns]
+
     _CFG.clear()
     _CFG.update(opts)
-    _CFG["rx"] = [re.compile(p if opts["regex"] else re.escape(p), flags)
-                  for p in (unicodedata.normalize("NFC", p)
-                            for p in opts["patterns"])]
+    _CFG["rx"] = compile_all(opts["patterns"])
+    _CFG["not_rx"] = compile_all(opts.get("exclude"))
     _CFG["fields"] = ({f.lower() for f in opts["fields"]}
                       if opts["fields"] else None)
 
@@ -674,41 +684,45 @@ def scan_one(path_str: str):
             kind = "TooManyOpenFiles"
         return path_str, [], f"{kind}: {exc}"
 
-    rxs, only, want = _CFG["rx"], _CFG["fields"], _CFG["snippets"]
-    mode, scope = _CFG["mode"], _CFG["scope"]
-
-    fields = []
+    rxs, only = _CFG["rx"], _CFG["fields"]
+    units = []
     for f, t in meta.items():
         if t and not (only and f.lower() not in only):
-            fields.extend(search_units(f, prepare_text(t), rxs, mode, scope,
-                                       _CFG["connected"]))
+            units.extend(search_units(f, prepare_text(t), rxs, _CFG["mode"],
+                                      _CFG["scope"], _CFG["connected"],
+                                      _CFG["not_rx"]))
+    hits = match_units(units, rxs, _CFG["mode"], _CFG["scope"],
+                       _CFG["snippets"])
+    if hits and any(n.search(text) for _, text in units for n in _CFG["not_rx"]):
+        hits = []  # --not: an excluded term turned up
+    return path_str, hits, None
 
+
+def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
+    """[(field, snippet)] when the (label, text) units match, else []."""
     if scope in ("field", "node"):
         # every term has to turn up inside one and the same field (or node)
         hits = []
-        for field, text in fields:
+        for field, text in units:
             found = [rx.search(text) for rx in rxs]
-            ok = all(found) if mode == "all" else any(found)
-            if ok:
+            if all(found) if mode == "all" else any(found):
                 m = next(x for x in found if x)
-                hits.append((field, _snippet(text, m) if want else ""))
-        return path_str, hits, None
+                hits.append((field, _snippet(text, m) if want_snippets else ""))
+        return hits
 
-    # scope == "image": the terms may be spread across different fields
-    matched: dict[int, tuple] = {}
-    for field, text in fields:
+    # scope "image": the terms may be spread across different fields
+    matched: dict = {}
+    for field, text in units:
         for i, rx in enumerate(rxs):
-            if i in matched:
-                continue
-            m = rx.search(text)
-            if m:
-                matched[i] = (field, _snippet(text, m) if want else "")
-        if len(matched) == len(rxs):
-            break                      # everything found, stop reading fields
-        if mode == "any" and matched:
-            break
+            if i not in matched:
+                m = rx.search(text)
+                if m:
+                    matched[i] = (field,
+                                  _snippet(text, m) if want_snippets else "")
+        if len(matched) == len(rxs) or (mode == "any" and matched):
+            break  # the remaining fields can't change the outcome
     ok = len(matched) == len(rxs) if mode == "all" else bool(matched)
-    return path_str, ([matched[i] for i in sorted(matched)] if ok else []), None
+    return [matched[i] for i in sorted(matched)] if ok else []
 
 
 def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
@@ -970,7 +984,8 @@ class ResultsFile:
             self._comment(f"imgmetasearch results — started {_now()}")
             for key in ("root", "patterns", "match", "scope", "regex",
                         "case_sensitive", "recursive", "ext", "fields",
-                        "hidden", "follow_symlinks", "only_connected"):
+                        "hidden", "follow_symlinks", "only_connected",
+                        "exclude"):
                 if key in params:
                     self._comment(f"{key}: {params[key]}")
             self._write(f"PARAMS\t{json.dumps(params, sort_keys=True)}")
@@ -1146,6 +1161,12 @@ def parse_args(argv=None):
                          "them all in the same one, 'node' all in the same "
                          "ComfyUI node (metadata without nodes counts one "
                          "field at a time, as with 'field')")
+    ap.add_argument("--not", nargs="+", metavar="PATTERN", dest="exclude",
+                    help="skip images where any of these turns up. Checks "
+                         "the same text the search does, so --fields, "
+                         "--regex, -s and --only-connected apply, but the "
+                         "whole image (whatever --scope says). Put it after "
+                         "the search patterns")
     ap.add_argument("-r", "--recursive", action="store_true",
                     help="descend into subfolders (default: top level only)")
     ap.add_argument("-j", "--workers", type=int, default=0, metavar="N",
@@ -1236,7 +1257,7 @@ def main(argv=None) -> int:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
     if args.regex:
-        for pattern in args.patterns:
+        for pattern in [*args.patterns, *(args.exclude or ())]:
             try:
                 re.compile(pattern)
             except re.error as exc:
@@ -1261,6 +1282,8 @@ def main(argv=None) -> int:
         }
         if connected:  # only when set, so older results files still resume
             params["only_connected"] = connected
+        if args.exclude:
+            params["exclude"] = args.exclude
         try:
             log = ResultsFile(args.results.expanduser().resolve(), params,
                               allow_resume=not args.no_resume)
@@ -1301,7 +1324,8 @@ def main(argv=None) -> int:
     paths = paths_factory()
 
     init_args = ({
-        "patterns": args.patterns, "regex": args.regex,
+        "patterns": args.patterns, "exclude": args.exclude,
+        "regex": args.regex,
         "case_sensitive": args.case_sensitive, "fields": args.fields,
         "snippets": args.verbose or args.as_json, "deep": args.deep,
         "mode": args.match, "scope": args.scope, "connected": connected,
