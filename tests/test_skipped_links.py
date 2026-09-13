@@ -5,7 +5,7 @@ import shutil
 
 import pytest
 
-from helpers import hit_names, run_cli, run_search
+from helpers import hit_names, run_cli, run_search, ssim
 
 # first bytes of a real Finder alias (a bookmark file), followed by filler
 ALIAS_BYTES = b"book\x00\x00\x00\x00mark\x00\x00\x00\x00" + bytes(range(256)) * 5
@@ -58,10 +58,14 @@ def test_symlinked_files_are_skipped_unless_followed(folder, tmp_path):
     assert hit_names(report) == {"real.png"}
     assert report["skipped_links"] == {"Finder alias": 1, "symlink": 1}
 
+    # the old option name still works; serial, so the original is met first
     followed = run_search(folder, "lighthouse", "-r", "--follow-symlinks",
-                          allow_errors=True)
-    assert hit_names(followed) == {"real.png", "linked.png"}
-    assert followed["skipped_links"] == {"Finder alias": 1}
+                          "-j", "1", allow_errors=True)
+    assert hit_names(followed) == {"real.png"}  # the link leads to the same image
+    assert followed["duplicates"] == 1
+    # the fake alias can't be opened: a dead link where aliases can be followed
+    fake_alias = "dead Finder alias" if ssim.CAN_RESOLVE_ALIASES else "Finder alias"
+    assert followed["skipped_links"] == {fake_alias: 1}
 
 
 def test_links_never_reach_the_index(folder, tmp_path):

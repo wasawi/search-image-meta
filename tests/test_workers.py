@@ -29,6 +29,6 @@ def test_scan_uses_one_config_from_start_to_end(sample_dir, monkeypatch):
         return real_extract(*args, **kwargs)
 
     monkeypatch.setattr(ssim, "extract_metadata", extract_while_another_worker_starts)
-    path, hits, error, _summary, _record = ssim.scan_one(
+    path, hits, error, _summary, _record, _original = ssim.scan_one(
         str(sample_dir / "01_stray_loader.png"))
     assert error is None and hits

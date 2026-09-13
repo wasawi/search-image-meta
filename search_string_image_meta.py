@@ -1440,6 +1440,8 @@ def _broken_reason(error: str) -> str:
 # a folder of them (e.g. from --link-type alias) looks like a folder of PNGs.
 _FINDER_ALIAS_MAGIC = b"book\x00\x00\x00\x00mark\x00\x00\x00\x00"
 SKIPPED_LINK = "SkippedLink: "  # error prefix: a link, not an image
+DEAD_LINK = "DeadLink: "        # error prefix: a followed link to nothing
+_MAX_LINK_HOPS = 4              # an alias may point at another alias
 
 
 def is_finder_alias(path: str) -> bool:
@@ -1450,42 +1452,129 @@ def is_finder_alias(path: str) -> bool:
         return False
 
 
-def scan_one(path_str: str):
-    """Worker: (path, [(field, snippet)], error, summary, index record).
+# Following an alias needs macOS's own bookmark functions (CoreFoundation).
+_cf = None
+if sys.platform == "darwin":
+    try:
+        import ctypes
+        import ctypes.util
 
-    The index record is None without --index, "cached" when the metadata
-    came from it, or (size, mtime_ns, metadata) for the parent to store.
+        _cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+        _ref = ctypes.c_void_p
+        _cf.CFURLCreateFromFileSystemRepresentation.argtypes = [
+            _ref, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        _cf.CFURLCreateFromFileSystemRepresentation.restype = _ref
+        _cf.CFURLCreateBookmarkDataFromFile.argtypes = [_ref, _ref, _ref]
+        _cf.CFURLCreateBookmarkDataFromFile.restype = _ref
+        _cf.CFURLCreateByResolvingBookmarkData.argtypes = [
+            _ref, _ref, ctypes.c_ulong, _ref, _ref,
+            ctypes.POINTER(ctypes.c_ubyte), _ref]
+        _cf.CFURLCreateByResolvingBookmarkData.restype = _ref
+        _cf.CFURLGetFileSystemRepresentation.argtypes = [
+            _ref, ctypes.c_bool, ctypes.c_char_p, ctypes.c_long]
+        _cf.CFURLGetFileSystemRepresentation.restype = ctypes.c_bool
+        _cf.CFRelease.argtypes = [_ref]
+        _cf.CFRelease.restype = None
+    except Exception:
+        _cf = None
+
+CAN_RESOLVE_ALIASES = _cf is not None
+# kCFURLBookmarkResolutionWithoutUIMask | ...WithoutMountingMask
+_RESOLVE_QUIETLY = (1 << 8) | (1 << 9)
+
+
+def resolve_finder_alias(path: str):
+    """The file a Finder alias points to, or None when it can't be found.
+
+    Never shows a dialog or mounts a disk: an alias to a deleted file or to an
+    unplugged drive just gives None, as does any other system.
+    """
+    if _cf is None:
+        return None
+    import ctypes
+
+    raw = os.fsencode(path)
+    url = _cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+    if not url:
+        return None
+    try:
+        data = _cf.CFURLCreateBookmarkDataFromFile(None, url, None)
+    finally:
+        _cf.CFRelease(url)
+    if not data:
+        return None
+    try:
+        stale = ctypes.c_ubyte(0)
+        target = _cf.CFURLCreateByResolvingBookmarkData(
+            None, data, _RESOLVE_QUIETLY, None, None, ctypes.byref(stale), None)
+    finally:
+        _cf.CFRelease(data)
+    if not target:
+        return None
+    try:
+        buffer = ctypes.create_string_buffer(4096)
+        if not _cf.CFURLGetFileSystemRepresentation(target, True, buffer, len(buffer)):
+            return None
+        return os.fsdecode(buffer.value)
+    finally:
+        _cf.CFRelease(target)
+
+
+def scan_one(path_str: str):
+    """Worker: (path, [(field, snippet)], error, summary, index record, original).
+
+    The index record is None without --index, "cached" when the metadata came
+    from it, or (path, size, mtime_ns, metadata) for the parent to store.
+    original is the file a followed link led to (--follow-links), else None.
     """
     cfg = _CFG  # this scan's config, whatever other workers do meanwhile
     deep, index_path = cfg.get("deep", False), cfg.get("index")
+    follow = cfg.get("follow_links")
     record = None
-    # links aren't images: a symlink would count its target a second time
-    if not cfg.get("follow_links") and os.path.islink(path_str):
-        return path_str, [], SKIPPED_LINK + "symlink", None, None
-    try:
-        meta = None
-        if index_path:
-            st = os.stat(path_str)
-            meta = index_lookup(index_path, path_str, st.st_size,
-                                st.st_mtime_ns, deep)
-            record = "cached" if meta is not None else None
-        if meta is None:
-            meta = extract_metadata(Path(path_str), deep=deep)
+    read_path, original = path_str, None
+    # links aren't images: a symlink would count its original a second time
+    if os.path.islink(path_str):
+        if not follow:
+            return path_str, [], SKIPPED_LINK + "symlink", None, None, None
+        read_path = original = os.path.realpath(path_str)
+        if not os.path.isfile(read_path):
+            return path_str, [], DEAD_LINK + "symlink", None, None, None
+    for _hop in range(_MAX_LINK_HOPS):
+        try:
+            meta = None
             if index_path:
-                record = (st.st_size, st.st_mtime_ns, meta)
-    except Exception as exc:
-        if is_finder_alias(path_str):  # only files that failed get checked
-            return path_str, [], SKIPPED_LINK + "Finder alias", None, None
-        kind = type(exc).__name__
-        errno = getattr(exc, "errno", None)
-        if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
-            kind = "TooManyOpenFiles"
-        message = str(exc).replace(repr(path_str), "").replace(path_str, "")
-        hint = "" if kind == "TooManyOpenFiles" else describe_unreadable(path_str)
-        return (path_str, [], f"{kind}: {message.strip(' :')}"
-                + (f" [{hint}]" if hint else ""), None, None)
+                st = os.stat(read_path)
+                meta = index_lookup(index_path, read_path, st.st_size,
+                                    st.st_mtime_ns, deep)
+                record = "cached" if meta is not None else None
+            if meta is None:
+                meta = extract_metadata(Path(read_path), deep=deep)
+                if index_path:
+                    record = (read_path, st.st_size, st.st_mtime_ns, meta)
+            break
+        except Exception as exc:
+            if is_finder_alias(read_path):  # only files that failed get checked
+                if not (follow and CAN_RESOLVE_ALIASES):
+                    return (path_str, [], SKIPPED_LINK + "Finder alias",
+                            None, None, None)
+                target = resolve_finder_alias(read_path)
+                if not target or not os.path.isfile(target):
+                    return (path_str, [], DEAD_LINK + "Finder alias",
+                            None, None, None)
+                read_path = original = target
+                continue
+            kind = type(exc).__name__
+            errno = getattr(exc, "errno", None)
+            if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
+                kind = "TooManyOpenFiles"
+            message = str(exc).replace(repr(read_path), "").replace(read_path, "")
+            hint = "" if kind == "TooManyOpenFiles" else describe_unreadable(read_path)
+            return (path_str, [], f"{kind}: {message.strip(' :')}"
+                    + (f" [{hint}]" if hint else ""), None, None, original)
+    else:  # aliases pointing at each other
+        return path_str, [], DEAD_LINK + "Finder alias", None, None, None
     if cfg.get("broken"):
-        return path_str, [], None, None, record  # readable, so not broken
+        return path_str, [], None, None, record, original  # readable, not broken
 
     rxs, only = cfg["rx"], cfg["fields"]
     units = []
@@ -1509,7 +1598,7 @@ def scan_one(path_str: str):
     if hits and any(n.search(text) for _, text in units for n in cfg["not_rx"]):
         hits = []  # --not: an excluded term turned up
     summary = summarize(meta) if hits and cfg.get("show") else None
-    return path_str, hits, None, summary, record
+    return path_str, hits, None, summary, record, original
 
 
 def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
@@ -1566,8 +1655,11 @@ def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
     if recursive:
         walker = os.walk(root, followlinks=follow_symlinks)
     else:
+        # symlinks too, even dead ones, so they're skipped or followed the
+        # same way as in a recursive walk (links to folders aside)
         walker = [(str(root), [],
-                   [e.name for e in os.scandir(root) if e.is_file()])]
+                   [e.name for e in os.scandir(root)
+                    if e.is_file() or (e.is_symlink() and not e.is_dir())])]
     excluded = [pattern.lower() for pattern in exclude_dirs]
     dated = since is not None or until is not None
 
@@ -2257,11 +2349,14 @@ def parse_args(argv=None):
     ap.add_argument("--hidden", action="store_true",
                     help="include hidden files and folders (dot-names, "
                          "and the hidden attribute on Windows)")
-    ap.add_argument("--follow-symlinks", action="store_true",
-                    help="follow symlinked folders (with -r) and symlinked "
-                         "files; without it symlinked files are skipped, so a "
-                         "folder of links doesn't count its images twice. "
-                         "Finder aliases are always skipped")
+    ap.add_argument("--follow-links", "--follow-symlinks", action="store_true",
+                    dest="follow_symlinks",
+                    help="search the images that symlinks and (on macOS) "
+                         "Finder aliases point to, and follow symlinked "
+                         "folders with -r; without it links are skipped. A "
+                         "link whose original is gone is a dead link "
+                         "(--broken lists it), and an image reached both "
+                         "directly and through links counts once")
     ap.add_argument("--link-dir", type=Path, metavar="DIR",
                     help="create a link/alias to each match in this folder")
     ap.add_argument("--link-type", default="auto",
@@ -2476,11 +2571,13 @@ def main(argv=None) -> int:
         "follow_links": args.follow_symlinks,
     },)
 
-    scanned = found = errors = 0
+    scanned = found = errors = duplicates = 0
+    matched_files: set = set()  # --follow-links: originals already counted
     results = []
     csv_out = csv.writer(sys.stdout, lineterminator="\n") if args.as_csv else None
     if csv_out:
         csv_out.writerow(["path", "field", "snippet", "link"]
+                         + (["original"] if args.follow_symlinks else [])
                          + (["positive", "negative", "intermediate", "models",
                              "loras", "sampler"] if args.show else []))
     started = time.monotonic()
@@ -2511,10 +2608,15 @@ def main(argv=None) -> int:
         sealed.add(dirpath)
         finish_dir(dirpath)
 
-    def handle(path_str, hits, error, summary, record, dirpath):
-        nonlocal scanned, found, errors
-        if error and error.startswith(SKIPPED_LINK):
-            link = error[len(SKIPPED_LINK):]
+    def handle(path_str, hits, error, summary, record, original, dirpath):
+        nonlocal scanned, found, errors, duplicates
+        if error and error.startswith(DEAD_LINK) and args.broken:
+            # --broken --follow-links: a link to nothing is a broken file
+            error = (f"DeadLink: {error[len(DEAD_LINK):]} whose original is "
+                     f"missing [link to a missing file]")
+        elif error and error.startswith((SKIPPED_LINK, DEAD_LINK)):
+            link = (error[len(SKIPPED_LINK):] if error.startswith(SKIPPED_LINK)
+                    else "dead " + error[len(DEAD_LINK):])
             skipped_links[link] = skipped_links.get(link, 0) + 1
             outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
             bar.advance()
@@ -2524,7 +2626,7 @@ def main(argv=None) -> int:
         if record == "cached":
             index.cached += 1
         elif record is not None:
-            index.add(path_str, *record[:2], args.deep, record[2])
+            index.add(record[0], record[1], record[2], args.deep, record[3])
         outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
 
         if error and args.broken:
@@ -2552,6 +2654,16 @@ def main(argv=None) -> int:
             finish_dir(dirpath)
             return
 
+        if args.follow_symlinks:
+            # an image reached directly and through links counts once
+            key = os.path.realpath(original or path_str)
+            if key in matched_files:
+                duplicates += 1
+                bar.advance()
+                finish_dir(dirpath)
+                return
+            matched_files.add(key)
+
         found += 1
         bar.advance(hit=True)
         bar.clear()
@@ -2559,7 +2671,8 @@ def main(argv=None) -> int:
         linked = None
         if dest_dir:  # done here in the parent, never in a worker
             try:
-                linked = make_link(Path(path_str), dest_dir, args.link_type,
+                linked = make_link(Path(original or path_str), dest_dir,
+                                   args.link_type,
                                    args.flatten, root,
                                    preserve_dates=not args.no_preserve_dates)
             except Exception as exc:
@@ -2574,15 +2687,19 @@ def main(argv=None) -> int:
                 "matches": [{"field": f, "snippet": s} for f, s in hits],
                 "link": str(linked) if linked else None,
             }
+            if original:
+                entry["original"] = original
             if args.show:
                 entry["summary"] = summary or {}
             results.append(entry)
         elif csv_out:
             extra = (list(summary_text(summary or {}).values())
                      if args.show else [])
+            followed = [original or ""] if args.follow_symlinks else []
             for field, snippet in hits:
                 csv_out.writerow([path_str, field, snippet,
-                                  str(linked) if linked else "", *extra])
+                                  str(linked) if linked else "", *followed,
+                                  *extra])
             sys.stdout.flush()
         elif args.null:
             sys.stdout.write(path_str + "\0")
@@ -2592,6 +2709,8 @@ def main(argv=None) -> int:
             if args.verbose:
                 for field, snippet in hits:
                     print(f"    ({field}) {snippet}")
+                if original:
+                    print(f"    (original) {original}")
                 if linked:
                     print(f"    -> {linked}")
             if args.show:
@@ -2674,6 +2793,7 @@ def main(argv=None) -> int:
              "error_kinds": error_kinds,
              "broken_reasons": broken_reasons,
              "skipped_links": skipped_links,
+             "duplicates": duplicates,
              "results": results},
             indent=2, ensure_ascii=False,
         ))
@@ -2686,7 +2806,10 @@ def main(argv=None) -> int:
             summary += "\n" + ", ".join(f"{count:,} {link}(s)" for link, count
                                         in sorted(skipped_links.items()))
             summary += " skipped (links, not images"
-            summary += ")" if args.follow_symlinks else "; --follow-symlinks follows symlinks)"
+            summary += ")" if args.follow_symlinks else "; --follow-links follows them)"
+        if duplicates:
+            summary += (f"\n{duplicates:,} match(es) reached again through links, "
+                        f"counted once")
         if errors:
             summary += f", {errors} unreadable"
             top = sorted(error_kinds.items(), key=lambda kv: -kv[1])[:3]
