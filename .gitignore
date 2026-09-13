@@ -11,3 +11,8 @@ samples/
 # private files that stay out of the repo
 *.ORIGINAL.py
 Krea2_turbo_00001_.png
+
+# packaging output
+build/
+dist/
+*.egg-info/

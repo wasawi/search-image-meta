@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build synthetic ComfyUI images for testing --only-connected.
+"""Synthetic ComfyUI images for the test suite.
 
 Each image carries `prompt` and `workflow` metadata written the way ComfyUI
 writes it (json.dumps into PNG tEXt chunks; EXIF Model/Make for WebP), with
@@ -7,13 +7,15 @@ the `prompt` matching what the frontend exports: every active node, wired or
 not, minus muted/bypassed/virtual nodes.
 
 Every scenario plants marker strings in nodes that are wired in and in nodes
-that aren't. samples/expected.json (and EXPECTED.md) record which markers each
-search mode should find; check_only_connected.py verifies that.
+that aren't; each scenario says which markers every search mode should find.
 
-Drag any PNG into ComfyUI to inspect its graph.
+To look at them yourself (drag any PNG into ComfyUI to inspect its graph):
+
+    python3 tests/samples.py [OUTDIR]        # default: ./samples
 """
 
 import json
+import sys
 import textwrap
 import uuid
 from pathlib import Path
@@ -21,7 +23,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 
-OUT = Path(__file__).with_name("samples")
 MODES = ("all", "linked", "output")
 
 
@@ -478,16 +479,25 @@ def card(title, desc, expect):
     return img
 
 
-def main():
-    OUT.mkdir(exist_ok=True)
+def expectations():
+    """({file: {marker: "all/linked/output" flags}}, [multi-term cases])."""
+    expected = {name: make()[4] for name, make in SCENARIOS}
+    multi = [{"patterns": pats, "args": args, "files": files, "fields": fields}
+             for pats, args, files, fields in MULTI]
+    return expected, multi
+
+
+def build(out: Path, quiet: bool = False):
+    """Write every sample plus EXPECTED.md into `out`; returns expectations()."""
+    out.mkdir(parents=True, exist_ok=True)
     expected, doc = {}, ["# --only-connected samples\n",
                          "`hit` = the marker should be found. Modes: `all` = no "
                          "flag, `linked` = `--only-connected`, `output` = "
                          "`--connected-mode output`.\n"]
-    for name, build in SCENARIOS:
-        title, desc, workflow, prompt, expect = build()
+    for name, make in SCENARIOS:
+        title, desc, workflow, prompt, expect = make()
         img = card(title, desc, expect)
-        path = OUT / name
+        path = out / name
         if name.endswith(".webp"):
             exif = img.getexif()
             exif[0x0110] = "prompt:" + json.dumps(prompt)       # EXIF Model
@@ -508,10 +518,10 @@ def main():
         for marker, flags in expect.items():
             cells = " | ".join("hit" if f == "y" else "—" for f in flags)
             doc.append(f"| `{marker}` | {cells} |")
-        print(f"wrote {path}")
+        if not quiet:
+            print(f"wrote {path}")
 
-    multi = [{"patterns": pats, "args": args, "files": files, "fields": fields}
-             for pats, args, files, fields in MULTI]
+    multi = expectations()[1]
     doc.append("\n## Multi-term searches (whole folder)\n\n"
                "| patterns | options | should match |\n|---|---|---|")
     for case in multi:
@@ -523,10 +533,9 @@ def main():
                 ", ".join(f"`{f}`" for f in fl) for fl in case["fields"].values())
         doc.append(f"| {pats} | {opts} | {files} |")
 
-    (OUT / "expected.json").write_text(json.dumps(expected, indent=2))
-    (OUT / "expected_multi.json").write_text(json.dumps(multi, indent=2))
-    (OUT / "EXPECTED.md").write_text("\n".join(doc) + "\n")
+    (out / "EXPECTED.md").write_text("\n".join(doc) + "\n", encoding="utf-8")
+    return expected, multi
 
 
 if __name__ == "__main__":
-    main()
+    build(Path(sys.argv[1] if len(sys.argv) > 1 else "samples"))

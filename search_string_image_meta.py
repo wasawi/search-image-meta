@@ -1408,9 +1408,14 @@ def main(argv=None) -> int:
     return 0 if (found or (log and log.prior_hits)) else 1  # grep-style status
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Console-script entry point."""
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         sys.stderr.write("\r\x1b[2Kinterrupted\n")
         sys.exit(130)
+
+
+if __name__ == "__main__":
+    cli()
