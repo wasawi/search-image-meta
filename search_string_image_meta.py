@@ -81,8 +81,8 @@ Examples
     # thorough pass: late PNG chunks and deep XMP, and list unreadable files
     python3 search_string_image_meta.py ~/Pictures "Barcelona" -r --deep --errors
 
-    # big local PSD/TIFF files: process pool, include dot-folders and symlinked dirs
-    python3 search_string_image_meta.py ~/Design "Photoshop" -r --pool process --ext psd tif --hidden --follow-symlinks
+    # a slow network share: threads instead of processes; dot-folders and linked dirs too
+    python3 search_string_image_meta.py /Volumes/NAS/Design "Photoshop" -r --pool thread -j 32 --ext psd tif --hidden --follow-symlinks
 
     # in scripts: no progress bar, no pre-count; exit status 0 = found, 1 = none
     python3 search_string_image_meta.py ~/output "Krea" -r --progress never --no-count > /dev/null && echo "found"
@@ -1939,10 +1939,12 @@ def parse_args(argv=None):
     ap.add_argument("-r", "--recursive", action="store_true",
                     help="descend into subfolders (default: top level only)")
     ap.add_argument("-j", "--workers", type=int, default=0, metavar="N",
-                    help="parallel workers (default: auto, 0 = auto, 1 = serial)")
-    ap.add_argument("--pool", default="thread", choices=["thread", "process"],
-                    help="thread pool (default, best for network/external drives) "
-                         "or process pool (best for big local XMP/PSD files)")
+                    help="parallel workers (default 0 = auto: half the CPU cores "
+                         "for processes, twice the cores for threads; 1 = serial)")
+    ap.add_argument("--pool", default="process", choices=["process", "thread"],
+                    help="process pool (default: uses every CPU core, about "
+                         "twice as fast on big searches) or thread pool "
+                         "(starts instantly; can suit slow network drives)")
     ap.add_argument("--regex", action="store_true", help="treat pattern as a regex")
     ap.add_argument("--case-sensitive", "-s", action="store_true",
                     help="case-sensitive match (default: insensitive)")
@@ -2119,8 +2121,13 @@ def main(argv=None) -> int:
 
     skip_dirs = log.completed_dirs if log else frozenset()
 
-    workers = args.workers or min(32, (os.cpu_count() or 4) * 2)
-    workers = max(1, workers)
+    cpus = os.cpu_count() or 4
+    # Processes do the CPU work in parallel and gain nothing past about half
+    # the cores (they end up waiting on the disk and each other; measured on
+    # 55k images). Threads mostly wait on I/O, so more of them still help.
+    auto = (max(2, min(16, cpus // 2)) if args.pool == "process"
+            else min(32, cpus * 2))
+    workers = max(1, args.workers or auto)
 
     # Every worker holds at least one file descriptor; leave headroom for the
     # results file, the pool's own pipes and stdio.

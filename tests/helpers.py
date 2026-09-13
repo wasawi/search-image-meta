@@ -14,11 +14,18 @@ import search_string_image_meta as ssim  # noqa: E402
 
 
 def run_cli(*argv):
-    """(exit code, stdout, stderr) of one in-process run."""
+    """(exit code, stdout, stderr) of one in-process run.
+
+    Uses the thread pool unless the test picks one: it starts instantly, and
+    monkeypatching the module reaches its workers.
+    """
+    argv = [str(a) for a in argv]
+    if "--pool" not in argv:
+        argv += ["--pool", "thread"]
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         try:
-            code = ssim.main([str(a) for a in argv])
+            code = ssim.main(argv)
         except SystemExit as exc:  # argparse rejecting the command line
             code = exc.code
     return code, out.getvalue(), err.getvalue()

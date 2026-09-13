@@ -177,12 +177,11 @@ search-image-meta /Volumes/Photos "krea" -r --results ~/krea_results.txt
   (roughly 12 KB per ComfyUI image); delete it to start over.
 - `--results FILE` records settings, finished folders and matches; rerunning
   with the same settings skips finished folders (`--no-resume` to start fresh).
-- `--pool process` spreads the work over every CPU core and is usually the
-  fastest for big searches: on 55,000 ComfyUI images it took 14 s against 26 s
-  with the default thread pool, and 13 s against 42 s for a search with
-  accented or Chinese terms. The thread pool starts instantly, which suits
-  small folders. `-j N` sets the number of workers (default: twice the CPU
-  count, up to 32).
+- The work runs in a pool of processes, which uses every CPU core: on 55,000
+  ComfyUI images that took 14 s against 26 s with threads, and 13 s against
+  42 s for a search with accented or Chinese terms. `--pool thread` starts
+  instantly and can suit slow network drives. `-j N` sets the number of workers (default: half the CPU cores for processes,
+  twice the cores for threads).
 - `--progress never` and `--no-count` keep the output quiet and skip the
   counting pass.
 
