@@ -1195,19 +1195,24 @@ def _worker_init(opts: dict):
         return [re.compile(p if opts["regex"] else re.escape(p), flags)
                 for p in patterns]
 
-    _CFG.clear()
-    _CFG.update(opts)
-    _CFG["rx"] = compile_all(opts["patterns"])
-    _CFG["not_rx"] = compile_all(opts.get("exclude"))
+    cfg = dict(opts)
+    cfg["rx"] = compile_all(opts["patterns"])
+    cfg["not_rx"] = compile_all(opts.get("exclude"))
     # Decoding escapes and composing accents only ever produces non-ASCII
     # characters, so all-ASCII terms can't gain a match from it: skip the work
     # (graph views still decode, since parsing the JSON does)
-    _CFG["unicode"] = not all(p.isascii() for p in
-                              [*opts["patterns"], *(opts.get("exclude") or ())])
-    _CFG["node_types"] = [t.lower() for t in opts.get("node_types") or ()]
-    _CFG["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
-    _CFG["fields"] = ({f.lower() for f in opts["fields"]}
-                      if opts["fields"] else None)
+    cfg["unicode"] = not all(p.isascii() for p in
+                             [*opts["patterns"], *(opts.get("exclude") or ())])
+    cfg["node_types"] = [t.lower() for t in opts.get("node_types") or ()]
+    cfg["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
+    cfg["fields"] = ({f.lower() for f in opts["fields"]}
+                     if opts["fields"] else None)
+
+    # Thread-pool workers share this module and each runs this as it starts,
+    # possibly while another is mid-scan: swap in a whole new config instead
+    # of changing the one in use (scan_one holds on to the one it began with)
+    global _CFG
+    _CFG = cfg
 
 
 def _snippet(text: str, match: re.Match) -> str:
@@ -1226,7 +1231,8 @@ def scan_one(path_str: str):
     The index record is None without --index, "cached" when the metadata
     came from it, or (size, mtime_ns, metadata) for the parent to store.
     """
-    deep, index_path = _CFG.get("deep", False), _CFG.get("index")
+    cfg = _CFG  # this scan's config, whatever other workers do meanwhile
+    deep, index_path = cfg.get("deep", False), cfg.get("index")
     record = None
     try:
         meta = None
@@ -1246,20 +1252,20 @@ def scan_one(path_str: str):
             kind = "TooManyOpenFiles"
         return path_str, [], f"{kind}: {exc}", None, None
 
-    rxs, only = _CFG["rx"], _CFG["fields"]
+    rxs, only = cfg["rx"], cfg["fields"]
     units = []
     for f, t in meta.items():
         if t and not (only and f.lower() not in only):
-            text = prepare_text(t) if _CFG["unicode"] else t
-            units.extend(search_units(f, text, rxs, _CFG["mode"],
-                                      _CFG["scope"], _CFG["connected"],
-                                      _CFG["not_rx"], _CFG["node_types"],
-                                      _CFG["inputs"]))
-    hits = match_units(units, rxs, _CFG["mode"], _CFG["scope"],
-                       _CFG["snippets"])
-    if hits and any(n.search(text) for _, text in units for n in _CFG["not_rx"]):
+            text = prepare_text(t) if cfg["unicode"] else t
+            units.extend(search_units(f, text, rxs, cfg["mode"],
+                                      cfg["scope"], cfg["connected"],
+                                      cfg["not_rx"], cfg["node_types"],
+                                      cfg["inputs"]))
+    hits = match_units(units, rxs, cfg["mode"], cfg["scope"],
+                       cfg["snippets"])
+    if hits and any(n.search(text) for _, text in units for n in cfg["not_rx"]):
         hits = []  # --not: an excluded term turned up
-    summary = summarize(meta) if hits and _CFG.get("show") else None
+    summary = summarize(meta) if hits and cfg.get("show") else None
     return path_str, hits, None, summary, record
 
 
@@ -1546,7 +1552,9 @@ if sys.platform == "win32":
 CAN_SET_CREATION_TIME = _libc is not None or _kernel32 is not None
 
 
-def _set_creation_time_windows(path: Path, birthtime_ns: int, follow: bool) -> bool:
+def _set_file_times_windows(path: Path, follow: bool, created_ns=None,
+                            accessed_ns=None, modified_ns=None) -> bool:
+    """SetFileTime on a file, or with follow=False on a symlink itself."""
     import ctypes
     from ctypes import wintypes
 
@@ -1558,10 +1566,16 @@ def _set_creation_time_windows(path: Path, birthtime_ns: int, follow: bool) -> b
                                    flags, None)
     if handle is None or handle == ctypes.c_void_p(-1).value:
         return False
+    stamps = []
+    for ns in (created_ns, accessed_ns, modified_ns):
+        if ns is None:
+            stamps.append(None)
+        else:
+            ticks = ns // 100 + 116444736000000000  # 100 ns steps since 1601
+            stamps.append(wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32))
     try:
-        ticks = birthtime_ns // 100 + 116444736000000000  # since 1601, 100ns
-        stamp = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
-        return bool(_kernel32.SetFileTime(handle, ctypes.byref(stamp), None, None))
+        return bool(_kernel32.SetFileTime(
+            handle, *(None if s is None else ctypes.byref(s) for s in stamps)))
     finally:
         _kernel32.CloseHandle(handle)
 
@@ -1569,7 +1583,7 @@ def _set_creation_time_windows(path: Path, birthtime_ns: int, follow: bool) -> b
 def set_creation_time(path: Path, birthtime_ns: int, follow: bool = True) -> bool:
     """Set a file's creation date (macOS, Windows). False where unsupported."""
     if _kernel32 is not None:
-        return _set_creation_time_windows(path, birthtime_ns, follow)
+        return _set_file_times_windows(path, follow, created_ns=birthtime_ns)
     if _libc is None:
         return False
     import ctypes
@@ -1600,10 +1614,16 @@ def copy_timestamps(src: Path, dest: Path, mode: str) -> bool:
     follow = mode != "symlink"
     ok = True
 
-    try:
-        os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=follow)
-    except (OSError, NotImplementedError):
-        ok = False
+    if not follow and _kernel32 is not None:
+        # os.utime can't reach a symlink itself on Windows
+        ok = _set_file_times_windows(dest, False, accessed_ns=st.st_atime_ns,
+                                     modified_ns=st.st_mtime_ns)
+    else:
+        try:
+            os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns),
+                     follow_symlinks=follow)
+        except (OSError, NotImplementedError):
+            ok = False
 
     birth_ns = getattr(st, "st_birthtime_ns", None)
     if birth_ns is None and os.name == "nt":
