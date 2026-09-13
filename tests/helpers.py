@@ -17,7 +17,10 @@ def run_cli(*argv):
     """(exit code, stdout, stderr) of one in-process run."""
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        code = ssim.main([str(a) for a in argv])
+        try:
+            code = ssim.main([str(a) for a in argv])
+        except SystemExit as exc:  # argparse rejecting the command line
+            code = exc.code
     return code, out.getvalue(), err.getvalue()
 
 

@@ -58,6 +58,12 @@ Examples
     # machine-readable results (paths, fields, snippets, stats)
     python3 search_string_image_meta.py ~/output "Krea" -r --json > krea_hits.json
 
+    # a spreadsheet of matches: this month only, skipping old render folders
+    python3 search_string_image_meta.py ~/output "Krea" -r --csv --since 2026-09-01 --exclude-dir "old_*" > krea.csv
+
+    # hand the matches to another command, safe with any file name
+    python3 search_string_image_meta.py ~/output "Krea" -r -0 --since 3d | xargs -0 ls -l
+
     # resumable log: rerun the same command to skip folders already done
     python3 search_string_image_meta.py /Volumes/Photos "Krea" -r --results ~/krea_results.txt
     python3 search_string_image_meta.py /Volumes/Photos "Krea" -r --results ~/krea_results.txt --no-resume
@@ -78,6 +84,8 @@ Examples
 from __future__ import annotations
 
 import argparse
+import csv
+import fnmatch
 import json
 import os
 import re
@@ -89,6 +97,7 @@ import unicodedata
 import warnings
 from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
                                 ThreadPoolExecutor, wait)
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -768,22 +777,29 @@ def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
 
 
 def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
-              include_hidden: bool, skip_dirs=frozenset()):
+              include_hidden: bool, skip_dirs=frozenset(), exclude_dirs=(),
+              since=None, until=None):
     """Lazily yield ("file", dirpath, fullpath) then ("seal", dirpath, None).
 
     A "seal" event means the walker has emitted every candidate file in that
     directory, so once its outstanding jobs finish the directory is complete
-    and can be recorded as such.
+    and can be recorded as such. `exclude_dirs` are folder-name wildcards
+    (any case); `since` / `until` bound the modification time.
     """
     if recursive:
         walker = os.walk(root, followlinks=follow_symlinks)
     else:
         walker = [(str(root), [],
                    [e.name for e in os.scandir(root) if e.is_file()])]
+    excluded = [pattern.lower() for pattern in exclude_dirs]
+    dated = since is not None or until is not None
 
     for dirpath, dirnames, filenames in walker:
         if not include_hidden:
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if excluded:
+            dirnames[:] = [d for d in dirnames if not any(
+                fnmatch.fnmatchcase(d.lower(), pattern) for pattern in excluded)]
         if dirpath in skip_dirs:
             continue  # finished on an earlier run
         for filename in filenames:
@@ -795,8 +811,45 @@ def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
                     continue
             elif suffix not in DEFAULT_EXTS:
                 continue
-            yield "file", dirpath, os.path.join(dirpath, filename)
+            path = os.path.join(dirpath, filename)
+            if dated:
+                try:
+                    mtime = os.stat(path).st_mtime
+                except OSError:
+                    continue  # vanished while we were looking
+                if ((since is not None and mtime < since)
+                        or (until is not None and mtime >= until)):
+                    continue
+            yield "file", dirpath, path
         yield "seal", dirpath, None
+
+
+_RELATIVE_TIME = re.compile(r"(\d+(?:\.\d+)?)\s*([smhdw])", re.IGNORECASE)
+_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_when(text: str, end_of_day: bool = False) -> float:
+    """Timestamp for --since / --until.
+
+    Accepts 2026-09-01, "2026-09-01 18:30" (local time), or an age such as
+    30m, 12h, 3d, 2w. With `end_of_day` a bare date means the midnight after
+    it, so --until 2026-09-01 still includes that whole day.
+    """
+    text = text.strip()
+    age = _RELATIVE_TIME.fullmatch(text)
+    if age:
+        return time.time() - float(age.group(1)) * _SECONDS[age.group(2).lower()]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            when = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if end_of_day and fmt == "%Y-%m-%d":
+            when += timedelta(days=1)
+        return when.timestamp()
+    raise ValueError(f"not a date or age: {text!r} (use 2026-09-01, "
+                     f"'2026-09-01 18:30', or an age like 3d, 12h, 2w)")
 
 
 # --------------------------------------------------------------------------
@@ -1027,7 +1080,8 @@ class ResultsFile:
             for key in ("root", "patterns", "match", "scope", "regex",
                         "case_sensitive", "recursive", "ext", "fields",
                         "hidden", "follow_symlinks", "only_connected",
-                        "exclude", "node_types", "inputs"):
+                        "exclude", "node_types", "inputs",
+                        "exclude_dirs", "since", "until"):
                 if key in params:
                     self._comment(f"{key}: {params[key]}")
             self._write(f"PARAMS\t{json.dumps(params, sort_keys=True)}")
@@ -1234,6 +1288,17 @@ def parse_args(argv=None):
                     help="only these extensions, e.g. --ext png jpg")
     ap.add_argument("--fields", nargs="+", metavar="NAME",
                     help="only search these metadata fields, e.g. --fields prompt workflow")
+    ap.add_argument("--exclude-dir", nargs="+", metavar="NAME",
+                    dest="exclude_dirs",
+                    help="with -r: skip folders whose name matches one of "
+                         "these (wildcards allowed, any case), e.g. "
+                         "--exclude-dir 'old_*' thumbnails")
+    ap.add_argument("--since", metavar="WHEN",
+                    help="only files modified at or after WHEN: 2026-09-01, "
+                         "'2026-09-01 18:30', or an age like 30m, 12h, 3d, 2w")
+    ap.add_argument("--until", metavar="WHEN",
+                    help="only files modified before WHEN (a date on its own "
+                         "includes that whole day)")
     ap.add_argument("--hidden", action="store_true",
                     help="include dotfiles and dot-directories")
     ap.add_argument("--follow-symlinks", action="store_true",
@@ -1278,8 +1343,15 @@ def parse_args(argv=None):
                          "instead of a percentage bar")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="also print the matching field and a snippet")
-    ap.add_argument("--json", action="store_true", dest="as_json",
-                    help="emit results as JSON instead of plain paths")
+    output = ap.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit results as JSON instead of plain paths")
+    output.add_argument("--csv", action="store_true", dest="as_csv",
+                        help="emit CSV, one row per matching field: path, "
+                             "field, snippet, link")
+    output.add_argument("-0", "--null", action="store_true",
+                        help="print paths separated by NUL characters, for "
+                             "xargs -0")
     ap.add_argument("--errors", action="store_true",
                     help="report unreadable files on stderr")
     return ap.parse_args(argv)
@@ -1295,6 +1367,11 @@ def main(argv=None) -> int:
     exts = {("." + e.lower().lstrip(".")) for e in args.ext} if args.ext else None
     connected = ((args.connected_mode or "linked")
                  if args.only_connected or args.connected_mode else None)
+    try:
+        since = parse_when(args.since) if args.since else None
+        until = parse_when(args.until, end_of_day=True) if args.until else None
+    except ValueError as exc:
+        return _die(str(exc))
 
     dest_dir = None
     if args.link_dir:
@@ -1341,6 +1418,9 @@ def main(argv=None) -> int:
             params["node_types"] = args.node_types
         if args.inputs:
             params["inputs"] = args.inputs
+        for key in ("exclude_dirs", "since", "until"):
+            if getattr(args, key):
+                params[key] = getattr(args, key)
         try:
             log = ResultsFile(args.results.expanduser().resolve(), params,
                               allow_resume=not args.no_resume)
@@ -1371,7 +1451,8 @@ def main(argv=None) -> int:
 
     def paths_factory():
         return iter_work(root, args.recursive, exts,
-                         args.follow_symlinks, args.hidden, skip_dirs)
+                         args.follow_symlinks, args.hidden, skip_dirs,
+                         args.exclude_dirs or (), since, until)
 
     show_progress = (args.progress == "always" or
                      (args.progress == "auto" and sys.stderr.isatty()))
@@ -1384,13 +1465,17 @@ def main(argv=None) -> int:
         "patterns": args.patterns, "exclude": args.exclude,
         "regex": args.regex,
         "case_sensitive": args.case_sensitive, "fields": args.fields,
-        "snippets": args.verbose or args.as_json, "deep": args.deep,
+        "snippets": args.verbose or args.as_json or args.as_csv,
+        "deep": args.deep,
         "mode": args.match, "scope": args.scope, "connected": connected,
         "node_types": args.node_types, "inputs": args.inputs,
     },)
 
     scanned = found = errors = 0
     results = []
+    csv_out = csv.writer(sys.stdout, lineterminator="\n") if args.as_csv else None
+    if csv_out:
+        csv_out.writerow(["path", "field", "snippet", "link"])
     started = time.monotonic()
     interrupted = False
 
@@ -1463,6 +1548,14 @@ def main(argv=None) -> int:
                 "matches": [{"field": f, "snippet": s} for f, s in hits],
                 "link": str(linked) if linked else None,
             })
+        elif csv_out:
+            for field, snippet in hits:
+                csv_out.writerow([path_str, field, snippet,
+                                  str(linked) if linked else ""])
+            sys.stdout.flush()
+        elif args.null:
+            sys.stdout.write(path_str + "\0")
+            sys.stdout.flush()
         else:
             print(path_str, flush=True)
             if args.verbose:
