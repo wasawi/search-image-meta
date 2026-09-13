@@ -43,6 +43,12 @@ Examples
     # both terms inside the SAME ComfyUI node (e.g. one prompt box), wired nodes only
     python3 search_string_image_meta.py ~/output "lighthouse" "dusk" -r --scope node --only-connected
 
+    # a LoRA name, but only where a LoRA loader uses it
+    python3 search_string_image_meta.py ~/output "darkbrush" -r --node-type Lora
+
+    # only prompt text, not file names, titles or settings
+    python3 search_string_image_meta.py ~/output "lighthouse" -r --input text value
+
     # only the ComfyUI graph chunks, only PNGs, exact case
     python3 search_string_image_meta.py ~/output "LoRA" -r -s --fields prompt workflow --ext png
 
@@ -547,13 +553,36 @@ def _graph_nodes(graph: dict, kind: str) -> list:
     return found
 
 
+def _named_inputs(node: dict, kind: str, names) -> dict:
+    """The node's inputs / widget values whose name is in `names` (lowercase).
+
+    Prompt nodes name every input. Workflow nodes only do when a newer
+    frontend saved `widgets_values_named`, or when the node keeps a dict of
+    values (VideoHelperSuite); others are skipped — the prompt has them.
+    """
+    if kind == "prompt":
+        values = node.get("inputs")
+    else:
+        values = node.get("widgets_values_named")
+        if not isinstance(values, dict):
+            values = node.get("widgets_values")
+    if not isinstance(values, dict):
+        return {}
+    return {k: v for k, v in values.items()
+            if isinstance(k, str) and k.lower() in names}
+
+
 def search_units(field: str, text: str, rxs, mode: str, scope: str,
-                 connected, not_rxs=()) -> list:
+                 connected, not_rxs=(), node_types=(), inputs=()) -> list:
     """Split one metadata field into the (label, text) units to match against.
 
     Normally that's the field itself. When it holds a ComfyUI graph:
       connected     drops the unconnected nodes first ("linked" / "output")
       scope "node"  makes each node its own unit, labelled "field#node"
+      node_types    keeps only nodes whose type contains one of these
+      inputs        keeps only these named inputs of each node
+    The last two also make each node its own unit, and drop text that isn't
+    a graph at all.
     What remains is re-serialised the way ComfyUI writes it (json.dumps, with
     the real characters prepare_text() restored), so patterns written against
     the raw metadata keep matching. A filtered
@@ -561,11 +590,13 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
     use (not groups or canvas settings); with scope "node" only the nodes'
     own contents are searched.
     """
-    if not connected and scope != "node":
+    nodes_only = bool(node_types or inputs)
+    if not (connected or nodes_only) and scope != "node":
         return [(field, text)]
+    unchanged = [] if nodes_only else [(field, text)]  # text that isn't a graph
     head = _GRAPH_HEAD.match(text)
     if not head or ('"class_type"' not in text and '"nodes"' not in text):
-        return [(field, text)]
+        return unchanged
 
     # dropping or splitting up nodes can only lose matches: if the graph as a
     # whole can't match, there is nothing to find (or to exclude with --not)
@@ -579,18 +610,26 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
     try:
         data, _end = _JSON.raw_decode(text, head.end())
     except ValueError:
-        return [(field, text)]
+        return unchanged
     kind = _graph_kind(data)
     if kind is None:
-        return [(field, text)]
+        return unchanged
     if connected:
         data = (_connected_workflow(data, connected) if kind == "workflow"
                 else _connected_prompt(data, connected))
+    if scope != "node" and not nodes_only:
+        return [(field, head.group(0) + json.dumps(data, ensure_ascii=False))]
 
-    if scope == "node":
-        return [(f"{field}#{label}", json.dumps(node, ensure_ascii=False))
-                for label, node in _graph_nodes(data, kind)]
-    return [(field, head.group(0) + json.dumps(data, ensure_ascii=False))]
+    units = []
+    for label, node in _graph_nodes(data, kind):
+        node_type = str(node.get("class_type" if kind == "prompt" else "type"))
+        if node_types and not any(t in node_type.lower() for t in node_types):
+            continue
+        body = _named_inputs(node, kind, inputs) if inputs else node
+        if body:
+            units.append((f"{field}#{label}",
+                          json.dumps(body, ensure_ascii=False)))
+    return units
 
 
 # --------------------------------------------------------------------------
@@ -648,7 +687,7 @@ def _worker_init(opts: dict):
 
     patterns, exclude, regex, case_sensitive, fields, snippets, deep, mode
     ("all" / "any"), scope ("image" / "field" / "node"), connected (None /
-    "linked" / "output").
+    "linked" / "output"), node_types, inputs.
     """
     flags = (0 if opts["case_sensitive"] else re.IGNORECASE) | re.DOTALL
 
@@ -661,6 +700,8 @@ def _worker_init(opts: dict):
     _CFG.update(opts)
     _CFG["rx"] = compile_all(opts["patterns"])
     _CFG["not_rx"] = compile_all(opts.get("exclude"))
+    _CFG["node_types"] = [t.lower() for t in opts.get("node_types") or ()]
+    _CFG["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
     _CFG["fields"] = ({f.lower() for f in opts["fields"]}
                       if opts["fields"] else None)
 
@@ -690,7 +731,8 @@ def scan_one(path_str: str):
         if t and not (only and f.lower() not in only):
             units.extend(search_units(f, prepare_text(t), rxs, _CFG["mode"],
                                       _CFG["scope"], _CFG["connected"],
-                                      _CFG["not_rx"]))
+                                      _CFG["not_rx"], _CFG["node_types"],
+                                      _CFG["inputs"]))
     hits = match_units(units, rxs, _CFG["mode"], _CFG["scope"],
                        _CFG["snippets"])
     if hits and any(n.search(text) for _, text in units for n in _CFG["not_rx"]):
@@ -985,7 +1027,7 @@ class ResultsFile:
             for key in ("root", "patterns", "match", "scope", "regex",
                         "case_sensitive", "recursive", "ext", "fields",
                         "hidden", "follow_symlinks", "only_connected",
-                        "exclude"):
+                        "exclude", "node_types", "inputs"):
                 if key in params:
                     self._comment(f"{key}: {params[key]}")
             self._write(f"PARAMS\t{json.dumps(params, sort_keys=True)}")
@@ -1167,6 +1209,17 @@ def parse_args(argv=None):
                          "--regex, -s and --only-connected apply, but the "
                          "whole image (whatever --scope says). Put it after "
                          "the search patterns")
+    ap.add_argument("--node-type", nargs="+", metavar="TYPE", dest="node_types",
+                    help="only search ComfyUI nodes whose type contains one "
+                         "of these (any case), e.g. Lora, CLIPTextEncode, "
+                         "KSampler. Metadata that isn't a ComfyUI graph is "
+                         "skipped")
+    ap.add_argument("--input", nargs="+", metavar="NAME", dest="inputs",
+                    help="only search these node inputs / widget values, "
+                         "e.g. text ckpt_name lora_name seed (exact names, "
+                         "any case). Uses the prompt, and workflows saved by "
+                         "newer ComfyUI frontends. Metadata that isn't a "
+                         "ComfyUI graph is skipped")
     ap.add_argument("-r", "--recursive", action="store_true",
                     help="descend into subfolders (default: top level only)")
     ap.add_argument("-j", "--workers", type=int, default=0, metavar="N",
@@ -1284,6 +1337,10 @@ def main(argv=None) -> int:
             params["only_connected"] = connected
         if args.exclude:
             params["exclude"] = args.exclude
+        if args.node_types:
+            params["node_types"] = args.node_types
+        if args.inputs:
+            params["inputs"] = args.inputs
         try:
             log = ResultsFile(args.results.expanduser().resolve(), params,
                               allow_resume=not args.no_resume)
@@ -1329,6 +1386,7 @@ def main(argv=None) -> int:
         "case_sensitive": args.case_sensitive, "fields": args.fields,
         "snippets": args.verbose or args.as_json, "deep": args.deep,
         "mode": args.match, "scope": args.scope, "connected": connected,
+        "node_types": args.node_types, "inputs": args.inputs,
     },)
 
     scanned = found = errors = 0
