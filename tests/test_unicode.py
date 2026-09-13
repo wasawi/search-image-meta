@@ -68,7 +68,8 @@ def test_graph_only_text(uni_dir):
 
 def test_literal_backslash_u_is_left_alone(uni_dir):
     assert "escaped_backslash.png" not in hit_names(run_search(uni_dir, "一"))
-    assert hit_names(run_search(uni_dir, "\\u4e00")) == {"escaped_backslash.png"}
+    # an all-ASCII term skips decoding, so it may also meet the raw escapes
+    assert "escaped_backslash.png" in hit_names(run_search(uni_dir, "\\u4e00"))
 
 
 def test_unicode_case_and_accent_composition(uni_dir):
@@ -96,6 +97,30 @@ def test_snippets_show_real_characters(uni_dir):
     report = run_search(uni_dir, "女孩", "--fields", "prompt", "--only-connected")
     snippets = [m["snippet"] for r in report["results"] for m in r["matches"]]
     assert snippets and all("女孩" in s and "\\u" not in s for s in snippets)
+
+
+def test_ascii_terms_still_get_readable_snippets(uni_dir):
+    report = run_search(uni_dir, "STRAY", "--fields", "prompt")
+    snippets = [m["snippet"] for r in report["results"] for m in r["matches"]]
+    assert snippets and all("孤立节点" in s for s in snippets)
+
+
+def test_lone_surrogate_escape(tmp_path):
+    png(tmp_path / "odd.png", prompt=json.dumps(graph("broken " + chr(0xD800) + " 女孩")))
+    assert hit_names(run_search(tmp_path, "女孩")) == {"odd.png"}
+    assert hit_names(run_search(tmp_path, "女孩", "--only-connected")) == {"odd.png"}
+
+
+def test_escaped_quotes_from_other_writers(tmp_path):
+    backslash = chr(92)
+    text = json.dumps(graph('say "hi" 女孩'))
+    # a JavaScript-style writer escaping quotes as backslash-u0022
+    text = text.replace(backslash + '"hi' + backslash + '"',
+                        backslash + "u0022hi" + backslash + "u0022")
+    assert backslash + "u0022" in text
+    png(tmp_path / "quotes.png", prompt=text)
+    assert hit_names(run_search(tmp_path, "女孩", "--only-connected")) == {"quotes.png"}
+    assert hit_names(run_search(tmp_path, "hi", "女孩", "--scope", "node")) == {"quotes.png"}
 
 
 def test_control_character_escapes_still_parse(tmp_path):

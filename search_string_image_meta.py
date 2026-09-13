@@ -574,7 +574,8 @@ _SUBGRAPH_IO = ("-10", "-20")          # a subgraph's own input / output node
 _GRAPH_HEAD = re.compile(r"\s*(?:[A-Za-z_]\w*:)?\s*(?=\{)")
 _OUTPUT_TYPE = re.compile(r"save|preview|show|display|video_?combine|compar"
                           r"|websocket", re.IGNORECASE)
-_JSON = json.JSONDecoder()
+# not strict: decoded control-character escapes sit raw inside JSON strings
+_JSON = json.JSONDecoder(strict=False)
 
 
 def _is_output_type(node_type) -> bool:
@@ -1062,6 +1063,28 @@ def _unescape(m: re.Match) -> str:
     return m.group(0)  # an escaped backslash is text, never an escape
 
 
+_SURROGATE = re.compile("[" + chr(0xD800) + "-" + chr(0xDFFF) + "]")
+_QUOTE_ESCAPES = re.compile(r"[\\]u00(?:22|5[cC])")
+
+
+def _decode_escapes(text: str) -> str:
+    """Turn JSON unicode escapes into characters, leaving everything else."""
+    if not _QUOTE_ESCAPES.search(text):
+        try:
+            # raw_unicode_escape decodes backslash-u escapes and nothing else,
+            # tells an escaped backslash from an escape, and runs in C; text
+            # beyond Latin-1 goes in as escapes itself and comes back out
+            decoded = (text.encode("latin-1", "backslashreplace")
+                       .decode("raw_unicode_escape"))
+            if _SURROGATE.search(decoded):  # emoji arrive as surrogate pairs
+                decoded = decoded.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+            return decoded
+        except UnicodeError:
+            pass  # a cut-off or lone escape: go one at a time
+    # escaped quotes / backslashes would break the JSON if decoded wholesale
+    return _JSON_ESCAPE.sub(_unescape, text)
+
+
 def prepare_text(text: str) -> str:
     """Metadata text the way a person would type it into a search.
 
@@ -1069,7 +1092,7 @@ def prepare_text(text: str) -> str:
     in a terminal matches however the file stored it.
     """
     if _BACKSLASH_U in text and _JSON_START.match(text):
-        text = _JSON_ESCAPE.sub(_unescape, text)
+        text = _decode_escapes(text)
     if not text.isascii():
         text = unicodedata.normalize("NFC", text)
     return text
@@ -1181,6 +1204,11 @@ def _worker_init(opts: dict):
     _CFG.update(opts)
     _CFG["rx"] = compile_all(opts["patterns"])
     _CFG["not_rx"] = compile_all(opts.get("exclude"))
+    # Decoding escapes and composing accents only ever produces non-ASCII
+    # characters, so all-ASCII terms can't gain a match from it: skip the work
+    # (graph views still decode, since parsing the JSON does)
+    _CFG["unicode"] = not all(p.isascii() for p in
+                              [*opts["patterns"], *(opts.get("exclude") or ())])
     _CFG["node_types"] = [t.lower() for t in opts.get("node_types") or ()]
     _CFG["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
     _CFG["fields"] = ({f.lower() for f in opts["fields"]}
@@ -1190,7 +1218,10 @@ def _worker_init(opts: dict):
 def _snippet(text: str, match: re.Match) -> str:
     start = max(0, match.start() - SNIPPET_WIDTH // 3)
     end = min(len(text), match.end() + SNIPPET_WIDTH // 2)
-    out = _clean(text[start:end]).replace("\n", " ")
+    out = text[start:end]
+    if _BACKSLASH_U in out:  # readable even when the text wasn't decoded
+        out = _decode_escapes(out)
+    out = _clean(out).replace("\n", " ")
     return ("…" if start else "") + out + ("…" if end < len(text) else "")
 
 
@@ -1224,7 +1255,8 @@ def scan_one(path_str: str):
     units = []
     for f, t in meta.items():
         if t and not (only and f.lower() not in only):
-            units.extend(search_units(f, prepare_text(t), rxs, _CFG["mode"],
+            text = prepare_text(t) if _CFG["unicode"] else t
+            units.extend(search_units(f, text, rxs, _CFG["mode"],
                                       _CFG["scope"], _CFG["connected"],
                                       _CFG["not_rx"], _CFG["node_types"],
                                       _CFG["inputs"]))
