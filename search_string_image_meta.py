@@ -55,6 +55,9 @@ Examples
     # show which field matched, with a snippet of the surrounding text
     python3 search_string_image_meta.py ~/output "Krea" -r -v
 
+    # what made each match: prompts, models, LoRAs, seed / steps / sampler
+    python3 search_string_image_meta.py ~/output "fox" -r --show
+
     # machine-readable results (paths, fields, snippets, stats)
     python3 search_string_image_meta.py ~/output "Krea" -r --json > krea_hits.json
 
@@ -642,6 +645,156 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
 
 
 # --------------------------------------------------------------------------
+# summaries (--show)
+# --------------------------------------------------------------------------
+
+_MODEL_FILE = re.compile(r"\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx)$",
+                         re.IGNORECASE)
+_TEXT_INPUTS = {"text", "text_g", "text_l", "t5xxl", "clip_l", "prompt",
+                "string", "value", "string_a", "string_b", "text_a", "text_b"}
+# links that never lead to prompt text; not following them keeps traces short
+_NON_TEXT_LINKS = {"clip", "model", "vae", "image", "images", "pixels",
+                   "samples", "latent", "latent_image", "mask", "control_net",
+                   "noise", "sigmas", "sampler", "guider", "upscale_model",
+                   "clip_vision"}
+_SAMPLER_KEYS = ("seed", "noise_seed", "steps", "cfg", "sampler_name",
+                 "scheduler", "denoise")
+_A1111_KEYS = {"Seed": "seed", "Steps": "steps", "CFG scale": "cfg",
+               "Sampler": "sampler_name", "Schedule type": "scheduler",
+               "Denoising strength": "denoise"}
+
+
+def _is_link(value) -> bool:
+    return isinstance(value, list) and len(value) == 2
+
+
+def _lora(name, strength) -> str:
+    return name if strength in (None, "") else f"{name} ({strength})"
+
+
+def _texts_feeding(prompt: dict, nid: str, seen: set) -> list:
+    """Prompt text that reaches node `nid`, traced upstream in input order."""
+    if nid in seen or nid not in prompt:
+        return []
+    seen.add(nid)
+    texts = []
+    for name, value in (prompt[nid].get("inputs") or {}).items():
+        name = name.lower()
+        if _is_link(value):
+            if name not in _NON_TEXT_LINKS:
+                texts += _texts_feeding(prompt, str(value[0]), seen)
+        elif name in _TEXT_INPUTS and isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+    return texts
+
+
+def _summarize_prompt(prompt: dict) -> dict:
+    prompt = _connected_prompt(prompt, "output")  # only what made the image
+
+    def trace(role, class_hint=""):
+        texts, seen = [], set()
+        for node in prompt.values():
+            value = (node.get("inputs") or {}).get(role)
+            if (_is_link(value)
+                    and class_hint in str(node.get("class_type")).lower()):
+                texts += _texts_feeding(prompt, str(value[0]), seen)
+        return list(dict.fromkeys(texts))
+
+    # Flux-style guiders take a plain "conditioning" instead of positive
+    positive = trace("positive") or trace("conditioning", "guider")
+    negative = [t for t in trace("negative") if t not in positive]
+
+    models, loras, primary, extra = [], [], [], {}
+    for node in prompt.values():
+        inputs = node.get("inputs") or {}
+        for name, value in inputs.items():
+            if isinstance(value, dict) and value.get("lora"):
+                if value.get("on", True):  # rgthree Power Lora slot
+                    loras.append(_lora(value["lora"], value.get("strength")))
+            elif isinstance(value, str) and _MODEL_FILE.search(value):
+                if "lora" in name.lower():
+                    loras.append(_lora(value, inputs.get(
+                        "strength_model", inputs.get("strength"))))
+                else:
+                    models.append(value)
+        settings = {k: inputs[k] for k in _SAMPLER_KEYS
+                    if k in inputs and not _is_link(inputs[k])}
+        if "steps" in settings:
+            primary.append(settings)
+        else:  # custom sampling splits these over noise/sampler/guider nodes
+            for k, v in settings.items():
+                extra.setdefault(k, v)
+
+    samplers = primary or ([extra] if extra else [])
+    if len(samplers) == 1:
+        samplers = [{**samplers[0],
+                     **{k: v for k, v in extra.items() if k not in samplers[0]}}]
+    unique = []
+    for s in samplers:
+        if s not in unique:
+            unique.append(s)
+    return {"positive": positive, "negative": negative,
+            "models": list(dict.fromkeys(models)),
+            "loras": list(dict.fromkeys(loras)), "samplers": unique}
+
+
+def _summarize_a1111(text: str) -> dict:
+    lines = text.strip().splitlines()
+    settings = lines.pop() if lines and "Steps:" in lines[-1] else ""
+    positive, _, negative = "\n".join(lines).partition("Negative prompt:")
+    positive, negative = positive.strip(), negative.strip()
+    values = {k.strip(): v.strip().strip('"') for k, v in
+              re.findall(r'(?:^|,)\s*([\w ]+):\s*("[^"]*"|[^,]*)', settings)}
+    sampler = {key: values[name] for name, key in _A1111_KEYS.items()
+               if name in values}
+    return {
+        "positive": [positive] if positive else [],
+        "negative": [negative] if negative else [],
+        "models": [values["Model"]] if values.get("Model") else [],
+        "loras": [_lora(name, weight) for name, weight in
+                  re.findall(r"<lora:([^:>]+):?([^:>]*)", positive)],
+        "samplers": [sampler] if sampler else [],
+    }
+
+
+def summarize(meta: dict) -> dict:
+    """What produced an image: prompts, models, LoRAs, sampler settings.
+
+    Read from a ComfyUI prompt (only the nodes that reach an output) or from
+    A1111-style parameters; {} when the image has neither.
+    """
+    for text in meta.values():
+        text = prepare_text(text)
+        head = _GRAPH_HEAD.match(text)
+        if head and '"class_type"' in text:
+            try:
+                data, _end = _JSON.raw_decode(text, head.end())
+            except ValueError:
+                continue
+            if _graph_kind(data) == "prompt":
+                return _summarize_prompt(data)
+    for key, text in meta.items():
+        if key.lower() == "parameters" and "Steps:" in text:
+            return _summarize_a1111(prepare_text(text))
+    return {}
+
+
+def summary_text(summary: dict) -> dict:
+    """The summary as flat strings, for plain and CSV output."""
+    def one_line(text):
+        return " ".join(text.split())
+
+    return {
+        "positive": " | ".join(one_line(t) for t in summary.get("positive", ())),
+        "negative": " | ".join(one_line(t) for t in summary.get("negative", ())),
+        "models": ", ".join(summary.get("models", ())),
+        "loras": ", ".join(summary.get("loras", ())),
+        "sampler": "; ".join(", ".join(f"{k} {v}" for k, v in s.items())
+                             for s in summary.get("samplers", ())),
+    }
+
+
+# --------------------------------------------------------------------------
 # text normalisation
 # --------------------------------------------------------------------------
 #
@@ -723,7 +876,7 @@ def _snippet(text: str, match: re.Match) -> str:
 
 
 def scan_one(path_str: str):
-    """Worker: returns (path, [(field, snippet)], error or None)."""
+    """Worker: (path, [(field, snippet)], error or None, summary or None)."""
     path = Path(path_str)
     try:
         meta = extract_metadata(path, deep=_CFG.get("deep", False))
@@ -732,7 +885,7 @@ def scan_one(path_str: str):
         errno = getattr(exc, "errno", None)
         if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
             kind = "TooManyOpenFiles"
-        return path_str, [], f"{kind}: {exc}"
+        return path_str, [], f"{kind}: {exc}", None
 
     rxs, only = _CFG["rx"], _CFG["fields"]
     units = []
@@ -746,7 +899,8 @@ def scan_one(path_str: str):
                        _CFG["snippets"])
     if hits and any(n.search(text) for _, text in units for n in _CFG["not_rx"]):
         hits = []  # --not: an excluded term turned up
-    return path_str, hits, None
+    summary = summarize(meta) if hits and _CFG.get("show") else None
+    return path_str, hits, None, summary
 
 
 def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
@@ -1343,6 +1497,10 @@ def parse_args(argv=None):
                          "instead of a percentage bar")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="also print the matching field and a snippet")
+    ap.add_argument("--show", action="store_true",
+                    help="summarise what made each match: prompts, models, "
+                         "LoRAs and sampler settings, from a ComfyUI prompt "
+                         "(nodes that reach an output) or A1111 parameters")
     output = ap.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", dest="as_json",
                         help="emit results as JSON instead of plain paths")
@@ -1469,13 +1627,16 @@ def main(argv=None) -> int:
         "deep": args.deep,
         "mode": args.match, "scope": args.scope, "connected": connected,
         "node_types": args.node_types, "inputs": args.inputs,
+        "show": args.show,
     },)
 
     scanned = found = errors = 0
     results = []
     csv_out = csv.writer(sys.stdout, lineterminator="\n") if args.as_csv else None
     if csv_out:
-        csv_out.writerow(["path", "field", "snippet", "link"])
+        csv_out.writerow(["path", "field", "snippet", "link"]
+                         + (["positive", "negative", "models", "loras",
+                             "sampler"] if args.show else []))
     started = time.monotonic()
     interrupted = False
 
@@ -1502,7 +1663,7 @@ def main(argv=None) -> int:
         sealed.add(dirpath)
         finish_dir(dirpath)
 
-    def handle(path_str, hits, error, dirpath):
+    def handle(path_str, hits, error, summary, dirpath):
         nonlocal scanned, found, errors
         scanned += 1
         outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
@@ -1543,15 +1704,20 @@ def main(argv=None) -> int:
             log.record_hit(path_str, hits, linked)
 
         if args.as_json:
-            results.append({
+            entry = {
                 "path": path_str,
                 "matches": [{"field": f, "snippet": s} for f, s in hits],
                 "link": str(linked) if linked else None,
-            })
+            }
+            if args.show:
+                entry["summary"] = summary or {}
+            results.append(entry)
         elif csv_out:
+            extra = (list(summary_text(summary or {}).values())
+                     if args.show else [])
             for field, snippet in hits:
                 csv_out.writerow([path_str, field, snippet,
-                                  str(linked) if linked else ""])
+                                  str(linked) if linked else "", *extra])
             sys.stdout.flush()
         elif args.null:
             sys.stdout.write(path_str + "\0")
@@ -1563,6 +1729,10 @@ def main(argv=None) -> int:
                     print(f"    ({field}) {snippet}")
                 if linked:
                     print(f"    -> {linked}")
+            if args.show:
+                for key, value in summary_text(summary or {}).items():
+                    if value:
+                        print(f"    {key + ':':<9} {value}")
         bar.draw(force=True)
         finish_dir(dirpath)
 
