@@ -13,10 +13,17 @@ search-image-meta ~/ComfyUI/output "lighthouse" -r
 ```
 
 ```
-/Users/me/ComfyUI/output/2026-09/lighthouse_00012_.png
-/Users/me/ComfyUI/output/2026-09/lighthouse_00013_.png
+/Users/me/ComfyUI/output/02_stray_chain.png
+/Users/me/ComfyUI/output/01_stray_loader.png
+/Users/me/ComfyUI/output/06_set_get.png
+/Users/me/ComfyUI/output/11_node_scope.png
+/Users/me/ComfyUI/output/04_muted.png
+/Users/me/ComfyUI/output/03_bypassed.png
+/Users/me/ComfyUI/output/07_subgraph.png
+/Users/me/ComfyUI/output/09_stray_loader.webp
+/Users/me/ComfyUI/output/05_reroute.png
 
-2 match(es) in 18,204 image(s) scanned
+9 match(es) in 12 image(s) scanned
 ```
 
 ## Install
@@ -78,7 +85,20 @@ escapes.
 A ComfyUI image carries its whole graph twice: `prompt` (what ran) and
 `workflow` (the editor canvas, including notes, leftovers and disabled
 nodes). A plain search looks at all of it, so a checkpoint loader you left
-lying around unwired still makes an image match.
+lying around unwired still makes an image match. In these two images the
+only "krea" is an unwired checkpoint loader and a note:
+
+```
+$ search-image-meta ~/ComfyUI/output "krea" -r
+/Users/me/ComfyUI/output/01_stray_loader.png
+/Users/me/ComfyUI/output/09_stray_loader.webp
+
+2 match(es) in 12 image(s) scanned
+
+$ search-image-meta ~/ComfyUI/output "krea" -r --only-connected
+
+0 match(es) in 12 image(s) scanned
+```
 
 ```bash
 # only nodes wired into the graph: unconnected, muted and bypassed nodes,
@@ -108,6 +128,8 @@ search-image-meta ~/output "fox" -r --show
     models:   flux1-dev.safetensors, t5xxl_fp16.safetensors, clip_l.safetensors, ae.safetensors
     loras:    detail_tweaker.safetensors (0.6), style_a.safetensors (0.9)
     sampler:  seed 7, steps 28, cfg 1, sampler_name euler, scheduler simple, denoise 1
+
+1 match(es) in 12 image(s) scanned
 ```
 
 What counts as connected:
