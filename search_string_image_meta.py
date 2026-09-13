@@ -1436,6 +1436,20 @@ def _broken_reason(error: str) -> str:
     return hint.group(1) if hint else "unreadable"
 
 
+# A Finder alias is a small bookmark file that keeps the original's name, so
+# a folder of them (e.g. from --link-type alias) looks like a folder of PNGs.
+_FINDER_ALIAS_MAGIC = b"book\x00\x00\x00\x00mark\x00\x00\x00\x00"
+SKIPPED_LINK = "SkippedLink: "  # error prefix: a link, not an image
+
+
+def is_finder_alias(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(16) == _FINDER_ALIAS_MAGIC
+    except OSError:
+        return False
+
+
 def scan_one(path_str: str):
     """Worker: (path, [(field, snippet)], error, summary, index record).
 
@@ -1445,6 +1459,9 @@ def scan_one(path_str: str):
     cfg = _CFG  # this scan's config, whatever other workers do meanwhile
     deep, index_path = cfg.get("deep", False), cfg.get("index")
     record = None
+    # links aren't images: a symlink would count its target a second time
+    if not cfg.get("follow_links") and os.path.islink(path_str):
+        return path_str, [], SKIPPED_LINK + "symlink", None, None
     try:
         meta = None
         if index_path:
@@ -1457,6 +1474,8 @@ def scan_one(path_str: str):
             if index_path:
                 record = (st.st_size, st.st_mtime_ns, meta)
     except Exception as exc:
+        if is_finder_alias(path_str):  # only files that failed get checked
+            return path_str, [], SKIPPED_LINK + "Finder alias", None, None
         kind = type(exc).__name__
         errno = getattr(exc, "errno", None)
         if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
@@ -2239,7 +2258,10 @@ def parse_args(argv=None):
                     help="include hidden files and folders (dot-names, "
                          "and the hidden attribute on Windows)")
     ap.add_argument("--follow-symlinks", action="store_true",
-                    help="descend into symlinked directories (with -r)")
+                    help="follow symlinked folders (with -r) and symlinked "
+                         "files; without it symlinked files are skipped, so a "
+                         "folder of links doesn't count its images twice. "
+                         "Finder aliases are always skipped")
     ap.add_argument("--link-dir", type=Path, metavar="DIR",
                     help="create a link/alias to each match in this folder")
     ap.add_argument("--link-type", default="auto",
@@ -2451,6 +2473,7 @@ def main(argv=None) -> int:
         "node_types": args.node_types, "inputs": args.inputs,
         "show": args.show, "index": str(index.path) if index else None,
         "saved_prompts": args.saved_prompts, "broken": args.broken,
+        "follow_links": args.follow_symlinks,
     },)
 
     scanned = found = errors = 0
@@ -2469,6 +2492,7 @@ def main(argv=None) -> int:
     dirty: set[str] = set()            # dir had a read failure this run
     error_kinds: dict[str, int] = {}   # error type -> count
     broken_reasons: dict[str, int] = {}  # --broken: what the files hold
+    skipped_links: dict[str, int] = {}   # Finder aliases, symlinked files
 
     def finish_dir(dirpath: str) -> None:
         if dirpath not in sealed or outstanding.get(dirpath, 0) != 0:
@@ -2489,6 +2513,13 @@ def main(argv=None) -> int:
 
     def handle(path_str, hits, error, summary, record, dirpath):
         nonlocal scanned, found, errors
+        if error and error.startswith(SKIPPED_LINK):
+            link = error[len(SKIPPED_LINK):]
+            skipped_links[link] = skipped_links.get(link, 0) + 1
+            outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
+            bar.advance()
+            finish_dir(dirpath)
+            return
         scanned += 1
         if record == "cached":
             index.cached += 1
@@ -2642,6 +2673,7 @@ def main(argv=None) -> int:
              "interrupted": interrupted,
              "error_kinds": error_kinds,
              "broken_reasons": broken_reasons,
+             "skipped_links": skipped_links,
              "results": results},
             indent=2, ensure_ascii=False,
         ))
@@ -2650,6 +2682,11 @@ def main(argv=None) -> int:
         summary = f"\n{found} {noun} in {scanned} image(s) scanned"
         for reason, count in sorted(broken_reasons.items(), key=lambda kv: -kv[1]):
             summary += f"\n  {count:,} × {reason}"
+        if skipped_links:
+            summary += "\n" + ", ".join(f"{count:,} {link}(s)" for link, count
+                                        in sorted(skipped_links.items()))
+            summary += " skipped (links, not images"
+            summary += ")" if args.follow_symlinks else "; --follow-symlinks follows symlinks)"
         if errors:
             summary += f", {errors} unreadable"
             top = sorted(error_kinds.items(), key=lambda kv: -kv[1])[:3]

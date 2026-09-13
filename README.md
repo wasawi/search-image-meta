@@ -75,7 +75,7 @@ escapes.
 | `--scope image\|field\|node` | where several terms must be found: anywhere in the image (default), in one metadata field, or in one ComfyUI node |
 | `--fields NAME…` | only these metadata fields, e.g. `prompt workflow` |
 | `--ext EXT…` | only these file types, e.g. `png webp mp4` |
-| `-r`, `--hidden`, `--follow-symlinks` | walk subfolders, include hidden files, follow linked folders |
+| `-r`, `--hidden`, `--follow-symlinks` | walk subfolders, include hidden files, follow symlinked folders and files |
 | `--exclude-dir NAME…` | skip folders by name, wildcards allowed: `--exclude-dir "old_*" thumbnails` |
 | `--since WHEN`, `--until WHEN` | modification date: `2026-09-01`, `"2026-09-01 18:30"`, or an age like `3d`, `12h`, `2w` |
 | `--deep` | also read PNG text stored after the image data and XMP deep inside files (about 20× slower; rarely needed) |
@@ -198,7 +198,11 @@ search-image-meta ~/ComfyUI/output -r --broken --link-dir ~/broken --flatten pat
 `--broken` lists unreadable files instead of searching, with a hint from each
 file's size and first bytes: an empty file, only zero bytes, a damaged or
 cut-off PNG / JPEG / WebP, a HEIC or video container, HTML or JSON text saved
-with an image name, … The summary counts each kind. For thousands of files
+with an image name, … The summary counts each kind. Links aren't broken
+files: Finder aliases (which keep the original's name, e.g. from
+`--link-type alias`) are always skipped, and so are symlinked files unless you
+pass `--follow-symlinks`, so a folder of links never shows up as broken or
+counts its images twice. For thousands of files
 prefer symlinks (the default) over `--link-type alias`, which makes one Finder
 alias at a time.
 
