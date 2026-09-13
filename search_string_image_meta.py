@@ -29,7 +29,7 @@ Examples
     # regex + symlinks to the matches, 24 workers
     python3 search_string_image_meta.py ~/output "wan.?2\\.2" -r --regex --link-dir ~/matches -j 24
 
-    # real Finder aliases instead of symlinks (macOS only)
+    # real Finder aliases (macOS) or shortcuts (Windows) instead of symlinks
     python3 search_string_image_meta.py ~/output "Krea" -r --link-dir ~/matches --link-type alias
 
     # skip ComfyUI nodes that aren't wired into the graph (stray loaders, notes…)
@@ -1255,6 +1255,20 @@ def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
     return [matched[i] for i in sorted(matched)] if ok else []
 
 
+def _is_hidden(dirpath: str, name: str) -> bool:
+    """Dot-names everywhere; on Windows also the hidden file attribute."""
+    if name.startswith("."):
+        return True
+    if os.name == "nt":
+        try:
+            attributes = os.stat(os.path.join(dirpath, name),
+                                 follow_symlinks=False).st_file_attributes
+        except OSError:
+            return False
+        return bool(attributes & 0x2)  # FILE_ATTRIBUTE_HIDDEN
+    return False
+
+
 def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
               include_hidden: bool, skip_dirs=frozenset(), exclude_dirs=(),
               since=None, until=None):
@@ -1275,20 +1289,20 @@ def iter_work(root: Path, recursive: bool, exts, follow_symlinks: bool,
 
     for dirpath, dirnames, filenames in walker:
         if not include_hidden:
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if not _is_hidden(dirpath, d)]
         if excluded:
             dirnames[:] = [d for d in dirnames if not any(
                 fnmatch.fnmatchcase(d.lower(), pattern) for pattern in excluded)]
         if dirpath in skip_dirs:
             continue  # finished on an earlier run
         for filename in filenames:
-            if not include_hidden and filename.startswith("."):
-                continue
             suffix = os.path.splitext(filename)[1].lower()
             if exts is not None:
                 if suffix not in exts:
                     continue
             elif suffix not in DEFAULT_EXTS:
+                continue
+            if not include_hidden and _is_hidden(dirpath, filename):
                 continue
             path = os.path.join(dirpath, filename)
             if dated:
@@ -1433,7 +1447,7 @@ def count_images(paths_factory, enabled: bool) -> int:
 
 
 # --------------------------------------------------------------------------
-# timestamp preservation (macOS creation date)
+# timestamp preservation (creation dates on macOS and Windows)
 # --------------------------------------------------------------------------
 
 # macOS keeps a real creation time (st_birthtime) that os.utime cannot touch.
@@ -1472,8 +1486,55 @@ if sys.platform == "darwin":
         _libc = None
 
 
+# Windows keeps one too; SetFileTime can change it.
+_kernel32 = None
+if sys.platform == "win32":
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                          wintypes.DWORD, wintypes.LPVOID,
+                                          wintypes.DWORD, wintypes.DWORD,
+                                          wintypes.HANDLE]
+        _kernel32.CreateFileW.restype = wintypes.HANDLE
+        _kernel32.SetFileTime.argtypes = [wintypes.HANDLE,
+                                          ctypes.POINTER(wintypes.FILETIME),
+                                          ctypes.POINTER(wintypes.FILETIME),
+                                          ctypes.POINTER(wintypes.FILETIME)]
+        _kernel32.SetFileTime.restype = wintypes.BOOL
+        _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    except Exception:
+        _kernel32 = None
+
+CAN_SET_CREATION_TIME = _libc is not None or _kernel32 is not None
+
+
+def _set_creation_time_windows(path: Path, birthtime_ns: int, follow: bool) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    flags = 0x02000000                      # FILE_FLAG_BACKUP_SEMANTICS
+    if not follow:
+        flags |= 0x00200000                 # FILE_FLAG_OPEN_REPARSE_POINT
+    handle = _kernel32.CreateFileW(str(path), 0x100,  # FILE_WRITE_ATTRIBUTES
+                                   0x1 | 0x2 | 0x4, None, 3,  # OPEN_EXISTING
+                                   flags, None)
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        return False
+    try:
+        ticks = birthtime_ns // 100 + 116444736000000000  # since 1601, 100ns
+        stamp = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+        return bool(_kernel32.SetFileTime(handle, ctypes.byref(stamp), None, None))
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
 def set_creation_time(path: Path, birthtime_ns: int, follow: bool = True) -> bool:
-    """Set a file's macOS creation date. Returns False where unsupported."""
+    """Set a file's creation date (macOS, Windows). False where unsupported."""
+    if _kernel32 is not None:
+        return _set_creation_time_windows(path, birthtime_ns, follow)
     if _libc is None:
         return False
     import ctypes
@@ -1510,6 +1571,8 @@ def copy_timestamps(src: Path, dest: Path, mode: str) -> bool:
         ok = False
 
     birth_ns = getattr(st, "st_birthtime_ns", None)
+    if birth_ns is None and os.name == "nt":
+        birth_ns = st.st_ctime_ns  # the creation time on Windows before 3.12
     if birth_ns is None:
         birth = getattr(st, "st_birthtime", None)
         birth_ns = int(birth * 1_000_000_000) if birth else st.st_mtime_ns
@@ -1662,10 +1725,10 @@ def _make_finder_alias(src: Path, dest_dir: Path, name: str) -> Path:
     target = _unique_target(dest_dir, name)
     script = (
         'tell application "Finder"\n'
-        f'  set theFile to POSIX file "{src}" as alias\n'
-        f'  set theDir to POSIX file "{dest_dir}" as alias\n'
+        f'  set theFile to POSIX file {_applescript_string(src)} as alias\n'
+        f'  set theDir to POSIX file {_applescript_string(dest_dir)} as alias\n'
         '  set newAlias to make new alias file at theDir to theFile\n'
-        f'  set name of newAlias to "{target.name}"\n'
+        f'  set name of newAlias to {_applescript_string(target.name)}\n'
         'end tell'
     )
     subprocess.run(["osascript", "-e", script],
@@ -1673,8 +1736,51 @@ def _make_finder_alias(src: Path, dest_dir: Path, name: str) -> Path:
     return target
 
 
+def _applescript_string(text) -> str:
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _make_windows_shortcut(src: Path, dest_dir: Path, name: str) -> Path:
+    """A Windows shortcut (.lnk), made through PowerShell's WScript.Shell."""
+    target = _unique_target(dest_dir, name + ".lnk")
+
+    def quoted(path) -> str:
+        return "'" + str(path).replace("'", "''") + "'"
+
+    script = (f"$s = (New-Object -ComObject WScript.Shell)"
+              f".CreateShortcut({quoted(target)}); "
+              f"$s.TargetPath = {quoted(src)}; $s.Save()")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    script], check=True, capture_output=True, text=True)
+    return target
+
+
+def _link_once(src: Path, target: Path, mode: str) -> None:
+    if mode == "symlink":
+        if target.is_symlink():
+            target.unlink()
+        target.symlink_to(src)
+    elif mode == "hardlink":
+        if not target.exists():
+            os.link(src, target)
+    elif mode == "copy":
+        shutil.copy2(src, target)
+    else:
+        raise ValueError(f"unknown link type: {mode}")
+
+
+# what --link-type auto tries, in order: on Windows symlinks need Developer
+# Mode or admin rights, and hardlinks only work within one drive
+AUTO_LINK_TYPES = (["symlink", "hardlink", "copy"] if os.name == "nt"
+                   else ["symlink"])
+
+
 def make_link(src: Path, dest_dir: Path, mode: str, flatten: str, root: Path,
               preserve_dates: bool = True) -> Path:
+    """Put a link to `src` into `dest_dir`; returns what was created.
+
+    "auto" tries AUTO_LINK_TYPES in order until one works.
+    """
     if flatten == "path":
         try:
             name = "__".join(src.relative_to(root).parts)
@@ -1684,33 +1790,75 @@ def make_link(src: Path, dest_dir: Path, mode: str, flatten: str, root: Path,
         name = src.name
 
     if mode == "alias":
-        target = _make_finder_alias(src, dest_dir, name)
+        make = _make_windows_shortcut if os.name == "nt" else _make_finder_alias
+        target = make(src, dest_dir, name)
         if preserve_dates:
             copy_timestamps(src, target, mode)
         return target
 
-    target = _unique_target(dest_dir, name, src)
-    if mode == "symlink":
-        if target.is_symlink():
-            target.unlink()
-        target.symlink_to(src)
-    elif mode == "hardlink":
-        if not target.exists():
-            os.link(src, target)
-    elif mode == "copy":
-        import shutil
-        shutil.copy2(src, target)
-    else:
-        raise ValueError(f"unknown link type: {mode}")
-
-    if preserve_dates:
-        copy_timestamps(src, target, mode)
-    return target
+    attempts = AUTO_LINK_TYPES if mode == "auto" else [mode]
+    for attempt in attempts:
+        target = _unique_target(dest_dir, name, src)
+        try:
+            _link_once(src, target, attempt)
+        except OSError:
+            if attempt == attempts[-1]:
+                raise
+            continue
+        if preserve_dates:
+            copy_timestamps(src, target, attempt)
+        return target
+    raise AssertionError("unreachable")
 
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
+
+def _setup_stdio() -> None:
+    """Never crash printing a path or prompt the output can't encode.
+
+    Piped output is UTF-8 everywhere (Windows would otherwise use its ANSI
+    code page); a console that can't show a character gets a replacement.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue  # replaced by something that isn't a real text stream
+        try:
+            if stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def _ansi_terminal(stream) -> bool:
+    """Whether `stream` is a terminal that understands the bar's escape codes.
+
+    Windows consoles only do after ENABLE_VIRTUAL_TERMINAL_PROCESSING is on.
+    """
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-12)  # STD_ERROR_HANDLE
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
 
 def _die(msg: str) -> int:
     print(f"error: {msg}", file=sys.stderr)
@@ -1779,15 +1927,18 @@ def parse_args(argv=None):
                     help="only files modified before WHEN (a date on its own "
                          "includes that whole day)")
     ap.add_argument("--hidden", action="store_true",
-                    help="include dotfiles and dot-directories")
+                    help="include hidden files and folders (dot-names, "
+                         "and the hidden attribute on Windows)")
     ap.add_argument("--follow-symlinks", action="store_true",
                     help="descend into symlinked directories (with -r)")
     ap.add_argument("--link-dir", type=Path, metavar="DIR",
                     help="create a link/alias to each match in this folder")
-    ap.add_argument("--link-type", default="symlink",
-                    choices=["symlink", "alias", "hardlink", "copy"],
-                    help="symlink (default), alias = real macOS Finder alias, "
-                         "hardlink, or copy")
+    ap.add_argument("--link-type", default="auto",
+                    choices=["auto", "symlink", "alias", "hardlink", "copy"],
+                    help="auto (default) = symlink, or on Windows a symlink "
+                         "if allowed, else a hardlink, else a copy; alias = "
+                         "macOS Finder alias or Windows shortcut; symlink; "
+                         "hardlink; copy")
     ap.add_argument("--no-preserve-dates", action="store_true",
                     help="don't copy the original's creation and modification "
                          "dates onto the link/alias (they are copied by default)")
@@ -1846,6 +1997,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    _setup_stdio()
     args = parse_args(argv)
 
     root = args.folder.expanduser().resolve()
@@ -1866,11 +2018,12 @@ def main(argv=None) -> int:
         dest_dir = args.link_dir.expanduser().resolve()
         if dest_dir == root or (args.recursive and root in dest_dir.parents):
             return _die("--link-dir must be outside the searched folder")
-        if args.link_type == "alias" and sys.platform != "darwin":
-            return _die("--link-type alias only works on macOS")
-        if (not args.no_preserve_dates and _libc is None
+        if args.link_type == "alias" and sys.platform not in ("darwin", "win32"):
+            return _die("--link-type alias makes a macOS Finder alias or a "
+                        "Windows shortcut; use symlink on this system")
+        if (not args.no_preserve_dates and not CAN_SET_CREATION_TIME
                 and args.link_type != "hardlink"):
-            print("note: creation dates can only be set on macOS; "
+            print("note: creation dates can only be set on macOS and Windows; "
                   "modification dates will still be copied", file=sys.stderr)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1949,8 +2102,9 @@ def main(argv=None) -> int:
                          args.follow_symlinks, args.hidden, skip_dirs,
                          args.exclude_dirs or (), since, until)
 
+    ansi = _ansi_terminal(sys.stderr)  # also switches it on for Windows
     show_progress = (args.progress == "always" or
-                     (args.progress == "auto" and sys.stderr.isatty()))
+                     (args.progress == "auto" and ansi))
     total = None if args.no_count else count_images(paths_factory, show_progress)
     bar = Progress(total, show_progress)
 
