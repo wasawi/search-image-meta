@@ -118,6 +118,9 @@ search-image-meta ~/output "darkbrush" -r --node-type Lora
 # only prompt text, not file names, titles or settings
 search-image-meta ~/output "lighthouse" -r --input text value
 
+# the final prompt a save node stored, even one an LLM or a wildcard wrote
+search-image-meta ~/output "lighthouse" -r --saved-prompts prompt
+
 # what made each match: prompts, models, LoRAs, seed / steps / sampler
 search-image-meta ~/output "fox" -r --show
 ```
@@ -145,8 +148,24 @@ What counts as connected:
   exact input names; it uses `prompt`, and `workflow` files saved by newer
   frontends (older ones don't record widget names).
 - `--show` reads the `prompt` (only nodes that reach an output) or A1111
-  `parameters`. It doesn't evaluate switch nodes, so every connected branch is
-  listed.
+  `parameters`, and takes the prompts from a save node's record when there is
+  one. It doesn't evaluate switch nodes, so every connected branch is listed.
+
+### Prompts written by LLMs or wildcards
+
+ComfyUI stores the graph *before* it runs, so when an LLM node or a run-time
+wildcard writes your prompt, `prompt` and `workflow` only hold what went into
+that node — the instruction, not the result. Save nodes with prompt inputs
+capture the final text: for example a JSON record with `prompt`, `negative`
+and `intermediate_prompt_1`–`3` (MetaWriter's `gen_meta`, older `request` /
+`raw.meta` shapes, also inside a JPEG's EXIF comment), or A1111-style
+`parameters`.
+
+- `--saved-prompts` searches only those stored prompts; add `prompt`,
+  `negative` or `intermediate` to pick which. Each one counts as its own field,
+  so `--scope field` means "in the same prompt".
+- `--show` uses them for the positive, negative and intermediate prompts, and
+  says where they came from (`prompt_source` in `--json`).
 
 Videos from ComfyUI's SaveVideo / SaveWEBM and VideoHelperSuite, and
 ComfyUI's WebP / AVIF images, get all of the above.

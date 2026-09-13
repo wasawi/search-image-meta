@@ -50,6 +50,9 @@ Examples
     # only prompt text, not file names, titles or settings
     python3 search_string_image_meta.py ~/output "lighthouse" -r --input text value
 
+    # the final prompt a save node stored (say, one an LLM wrote), not the graph
+    python3 search_string_image_meta.py ~/output "lighthouse" -r --saved-prompts prompt
+
     # only the ComfyUI graph chunks, only PNGs, exact case
     python3 search_string_image_meta.py ~/output "LoRA" -r -s --fields prompt workflow --ext png
 
@@ -193,7 +196,7 @@ def _decode_bytes(raw: bytes) -> str:
     """
     raw = bytes(raw)
     if raw[:8] == b"ASCII\x00\x00\x00":
-        return raw[8:].decode("ascii", "ignore")
+        return raw[8:].decode("utf-8", "ignore")  # often UTF-8 in practice
     if raw[:8] in (b"UNICODE\x00", b"UNICODE\x00\x00"[:8]):
         raw = raw[8:]
     if raw and raw.count(0) * 3 > len(raw):          # looks like UTF-16
@@ -568,7 +571,7 @@ _MODE_MUTED, _MODE_BYPASS = 2, 4       # LiteGraph node modes NEVER / BYPASS
 _SUBGRAPH_IO = ("-10", "-20")          # a subgraph's own input / output node
 _GRAPH_HEAD = re.compile(r"\s*(?:[A-Za-z_]\w*:)?\s*(?=\{)")
 _OUTPUT_TYPE = re.compile(r"save|preview|show|display|video_?combine|compar"
-                          r"|websocket", re.IGNORECASE)
+                          r"|websocket|writer", re.IGNORECASE)
 # not strict: decoded control-character escapes sit raw inside JSON strings
 _JSON = json.JSONDecoder(strict=False)
 
@@ -991,12 +994,88 @@ def _summarize_a1111(text: str) -> dict:
     }
 
 
+_SAVED_KEYS = (
+    ("prompt", ("prompt", "promt", "positive", "positive_prompt")),
+    ("negative", ("negative", "negative_prompt", "negativePrompt")),
+)
+_INTERMEDIATE_KEY = re.compile(r"intermediate_prompt_\d+")
+_SAVED_HINTS = ('"prompt"', '"promt"', '"positive', '"negative',
+                '"intermediate_prompt_', '"request"', '"raw"')
+
+
+def _prompt_record(data) -> list:
+    """[(key, kind, text)] from a save node's JSON record.
+
+    The flat shape MetaWriter writes as gen_meta (prompt, negative,
+    intermediate_prompt_1-3) and older ones: the fields under "request",
+    Civitai payloads under "raw"."meta", and the "promt" typo.
+    """
+    if not isinstance(data, dict):
+        return []
+    request = data.get("request")
+    raw = data.get("raw")
+    raw_meta = raw.get("meta") if isinstance(raw, dict) else None
+    sources = [s for s in (request, data, raw_meta) if isinstance(s, dict)]
+    found = []
+    for kind, keys in _SAVED_KEYS:
+        match = next(((key, source[key]) for source in sources for key in keys
+                      if isinstance(source.get(key), str) and source[key].strip()),
+                     None)
+        if match:
+            found.append((match[0], kind, match[1]))
+    found += [(key, "intermediate", value) for key, value in data.items()
+              if isinstance(key, str) and _INTERMEDIATE_KEY.fullmatch(key)
+              and isinstance(value, str) and value.strip()]
+    return found
+
+
+def saved_prompts(meta: dict) -> list:
+    """The prompts a save node stored itself, as [(field, key, kind, text)].
+
+    ComfyUI's own metadata is written before the graph runs, so a prompt an
+    LLM or a run-time wildcard produced is never in it; save nodes with prompt
+    inputs store the final text. kind is "prompt", "negative" or
+    "intermediate"; field names may hold colons themselves (Exif:UserComment),
+    so field and key are kept apart. Read from JSON records in any field
+    that isn't a ComfyUI graph (PNG text, an EXIF UserComment, …) and from
+    A1111-style `parameters`.
+    """
+    found = []
+    for field, text in meta.items():
+        if not isinstance(text, str) or not text:
+            continue
+        if field.lower() == "parameters":
+            parsed = _summarize_a1111(prepare_text(text))
+            for kind, key in (("prompt", "positive"), ("negative", "negative")):
+                found += [(field, kind, kind, t) for t in parsed[key]]
+            continue
+        body = text.lstrip("\x00 \t\r\n")  # an EXIF charset prefix may be NULs
+        head = _GRAPH_HEAD.match(body)
+        if (not head or field.lower() in ("prompt", "workflow")
+                or head.group(0).strip().lower() in ("prompt:", "workflow:")
+                or not any(hint in body for hint in _SAVED_HINTS)):
+            continue
+        try:
+            data, _end = _JSON.raw_decode(body, head.end())
+        except ValueError:
+            continue
+        if _graph_kind(data) is None:
+            found += [(field, key, kind, value)
+                      for key, kind, value in _prompt_record(data)]
+    return found
+
+
 def summarize(meta: dict) -> dict:
     """What produced an image: prompts, models, LoRAs, sampler settings.
 
-    Read from a ComfyUI prompt (only the nodes that reach an output) or from
-    A1111-style parameters; {} when the image has neither.
+    Models, LoRAs and sampler settings come from the ComfyUI prompt (only the
+    nodes that reach an output) or from A1111-style parameters. The prompts
+    come from what a save node stored when there is such a record, because
+    the graph only knows the inputs of nodes that write prompts at run time;
+    otherwise they are traced through the graph. prompt_source says which.
+    {} when the image has none of this.
     """
+    summary, source = {}, None
     for text in meta.values():
         text = prepare_text(text)
         head = _GRAPH_HEAD.match(text)
@@ -1006,11 +1085,34 @@ def summarize(meta: dict) -> dict:
             except ValueError:
                 continue
             if _graph_kind(data) == "prompt":
-                return _summarize_prompt(data)
-    for key, text in meta.items():
-        if key.lower() == "parameters" and "Steps:" in text:
-            return _summarize_a1111(prepare_text(text))
-    return {}
+                summary, source = _summarize_prompt(data), "graph"
+                break
+    if not summary:
+        for key, text in meta.items():
+            if key.lower() == "parameters" and "Steps:" in text:
+                summary = _summarize_a1111(prepare_text(text))
+                source = "parameters"
+                break
+
+    saved = saved_prompts(meta)
+    if not summary and not saved:
+        return {}
+    merged = {"positive": [], "negative": [], "models": [], "loras": [],
+              "samplers": []}
+    merged.update(summary)
+    positive = [(field, text) for field, _key, kind, text in saved
+                if kind == "prompt"]
+    if positive:
+        merged["positive"] = list(dict.fromkeys(text for _, text in positive))
+        merged["negative"] = list(dict.fromkeys(
+            text for _field, _key, kind, text in saved if kind == "negative"))
+        source = positive[0][0]
+    intermediate = list(dict.fromkeys(
+        text for _field, _key, kind, text in saved if kind == "intermediate"))
+    if intermediate:
+        merged["intermediate"] = intermediate
+    merged["prompt_source"] = source
+    return merged
 
 
 def summary_text(summary: dict) -> dict:
@@ -1021,6 +1123,8 @@ def summary_text(summary: dict) -> dict:
     return {
         "positive": " | ".join(one_line(t) for t in summary.get("positive", ())),
         "negative": " | ".join(one_line(t) for t in summary.get("negative", ())),
+        "intermediate": " | ".join(one_line(t)
+                                   for t in summary.get("intermediate", ())),
         "models": ", ".join(summary.get("models", ())),
         "loras": ", ".join(summary.get("loras", ())),
         "sampler": "; ".join(", ".join(f"{k} {v}" for k, v in s.items())
@@ -1101,7 +1205,7 @@ def prepare_text(text: str) -> str:
 # by path, size and modification time. Workers read it, each thread or
 # process on its own connection; only the parent writes, in batches.
 
-INDEX_VERSION = "1"  # bump whenever extraction changes, to re-read every file
+INDEX_VERSION = "2"  # bump whenever extraction changes, to re-read every file
 _INDEX_LOCAL = threading.local()
 
 
@@ -1205,6 +1309,9 @@ def _worker_init(opts: dict):
                              [*opts["patterns"], *(opts.get("exclude") or ())])
     cfg["node_types"] = [t.lower() for t in opts.get("node_types") or ()]
     cfg["inputs"] = {n.lower() for n in opts.get("inputs") or ()}
+    saved = opts.get("saved_prompts")  # None, or the kinds to search
+    cfg["saved"] = (None if saved is None
+                    else set(saved) or {"prompt", "negative", "intermediate"})
     cfg["fields"] = ({f.lower() for f in opts["fields"]}
                      if opts["fields"] else None)
 
@@ -1254,13 +1361,20 @@ def scan_one(path_str: str):
 
     rxs, only = cfg["rx"], cfg["fields"]
     units = []
-    for f, t in meta.items():
-        if t and not (only and f.lower() not in only):
-            text = prepare_text(t) if cfg["unicode"] else t
-            units.extend(search_units(f, text, rxs, cfg["mode"],
-                                      cfg["scope"], cfg["connected"],
-                                      cfg["not_rx"], cfg["node_types"],
-                                      cfg["inputs"]))
+    if cfg["saved"] is not None:
+        # --saved-prompts: every stored prompt is a unit of its own
+        for field, key, kind, text in saved_prompts(meta):
+            if kind in cfg["saved"] and not (only and field.lower() not in only):
+                units.append((f"{field}:{key}",
+                              prepare_text(text) if cfg["unicode"] else text))
+    else:
+        for f, t in meta.items():
+            if t and not (only and f.lower() not in only):
+                text = prepare_text(t) if cfg["unicode"] else t
+                units.extend(search_units(f, text, rxs, cfg["mode"],
+                                          cfg["scope"], cfg["connected"],
+                                          cfg["not_rx"], cfg["node_types"],
+                                          cfg["inputs"]))
     hits = match_units(units, rxs, cfg["mode"], cfg["scope"],
                        cfg["snippets"])
     if hits and any(n.search(text) for _, text in units for n in cfg["not_rx"]):
@@ -1677,7 +1791,7 @@ class ResultsFile:
             for key in ("root", "patterns", "match", "scope", "regex",
                         "case_sensitive", "recursive", "ext", "fields",
                         "hidden", "follow_symlinks", "only_connected",
-                        "exclude", "node_types", "inputs",
+                        "exclude", "node_types", "inputs", "saved_prompts",
                         "exclude_dirs", "since", "until"):
                 if key in params:
                     self._comment(f"{key}: {params[key]}")
@@ -1956,6 +2070,14 @@ def parse_args(argv=None):
                          "any case). Uses the prompt, and workflows saved by "
                          "newer ComfyUI frontends. Metadata that isn't a "
                          "ComfyUI graph is skipped")
+    ap.add_argument("--saved-prompts", nargs="*", metavar="KIND",
+                    choices=["prompt", "negative", "intermediate"],
+                    help="only search the prompts a save node stored itself "
+                         "(a JSON record such as MetaWriter's gen_meta, or "
+                         "A1111-style parameters), which hold the final text "
+                         "even when an LLM or a wildcard wrote it. Optionally "
+                         "only some kinds: prompt, negative, intermediate. Put "
+                         "it after the search patterns")
     ap.add_argument("-r", "--recursive", action="store_true",
                     help="descend into subfolders (default: top level only)")
     ap.add_argument("-j", "--workers", type=int, default=0, metavar="N",
@@ -2069,6 +2191,10 @@ def main(argv=None) -> int:
         until = parse_when(args.until, end_of_day=True) if args.until else None
     except ValueError as exc:
         return _die(str(exc))
+    if args.saved_prompts is not None and (args.node_types or args.inputs):
+        return _die("--saved-prompts searches what save nodes stored, not "
+                    "graph nodes, so it can't be combined with --node-type "
+                    "or --input")
 
     dest_dir = None
     if args.link_dir:
@@ -2116,6 +2242,8 @@ def main(argv=None) -> int:
             params["node_types"] = args.node_types
         if args.inputs:
             params["inputs"] = args.inputs
+        if args.saved_prompts is not None:
+            params["saved_prompts"] = sorted(args.saved_prompts) or ["all"]
         for key in ("exclude_dirs", "since", "until"):
             if getattr(args, key):
                 params[key] = getattr(args, key)
@@ -2181,6 +2309,7 @@ def main(argv=None) -> int:
         "mode": args.match, "scope": args.scope, "connected": connected,
         "node_types": args.node_types, "inputs": args.inputs,
         "show": args.show, "index": str(index.path) if index else None,
+        "saved_prompts": args.saved_prompts,
     },)
 
     scanned = found = errors = 0
@@ -2188,8 +2317,8 @@ def main(argv=None) -> int:
     csv_out = csv.writer(sys.stdout, lineterminator="\n") if args.as_csv else None
     if csv_out:
         csv_out.writerow(["path", "field", "snippet", "link"]
-                         + (["positive", "negative", "models", "loras",
-                             "sampler"] if args.show else []))
+                         + (["positive", "negative", "intermediate", "models",
+                             "loras", "sampler"] if args.show else []))
     started = time.monotonic()
     interrupted = False
 
@@ -2287,9 +2416,10 @@ def main(argv=None) -> int:
                 if linked:
                     print(f"    -> {linked}")
             if args.show:
-                for key, value in summary_text(summary or {}).items():
-                    if value:
-                        print(f"    {key + ':':<9} {value}")
+                flat = {k: v for k, v in summary_text(summary or {}).items() if v}
+                width = max([9] + [len(k) + 1 for k in flat])
+                for key, value in flat.items():
+                    print(f"    {key + ':':<{width}} {value}")
         bar.draw(force=True)
         finish_dir(dirpath)
 

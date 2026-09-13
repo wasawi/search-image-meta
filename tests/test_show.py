@@ -123,7 +123,8 @@ def test_csv_columns(fox_dir):
     assert code == 0, err
     rows = list(csv.DictReader(io.StringIO(out)))
     assert list(rows[0]) == ["path", "field", "snippet", "link", "positive",
-                             "negative", "models", "loras", "sampler"]
+                             "negative", "intermediate", "models", "loras",
+                             "sampler"]
     assert rows[0]["positive"] == "a red fox in snow | cinematic lighting"
     assert rows[0]["models"].startswith("flux1-dev.safetensors, ")
 

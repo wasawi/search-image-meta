@@ -32,3 +32,5 @@ py-modules = ["search_string_image_meta"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# the script silences this itself; pytest resets warning filters per test
+filterwarnings = ["ignore:XMP data cannot be read without defusedxml"]
