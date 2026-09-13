@@ -93,6 +93,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fnmatch
+import io
 import json
 import os
 import re
@@ -401,23 +402,17 @@ def _ebml_number(read, keep_marker: bool):
 
 
 def _ebml_children(buf: bytes, start: int, end: int):
-    pos = start
-    while pos < end:
-        view = memoryview(buf)
-        cursor = [pos]
-
-        def read(n):
-            chunk = bytes(view[cursor[0]:cursor[0] + n])
-            cursor[0] += n
-            return chunk
-
-        eid, _ = _ebml_number(read, True)
-        size, _ = _ebml_number(read, False)
-        body = cursor[0]
+    """(id, body start, end) of the EBML elements in buf[start:end]."""
+    stream = io.BytesIO(buf)
+    stream.seek(start)
+    while stream.tell() < end:
+        eid, _ = _ebml_number(stream.read, True)
+        size, _ = _ebml_number(stream.read, False)
+        body = stream.tell()
         if eid is None or size is None or body + size > end:
             return
         yield eid, body, body + size
-        pos = body + size
+        stream.seek(body + size)
 
 
 def _mkv_metadata(path: Path) -> dict:

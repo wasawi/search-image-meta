@@ -54,10 +54,11 @@ search-image-meta ~/output "Barcelona" -r --not "night" "rain"
 search-image-meta ~/output "wan.?2\.2" -r --regex -s
 ```
 
-Searches ignore case and accents written differently (`café` typed in a
-terminal matches however the file stored it). Chinese, Japanese, Korean and
-emoji work everywhere, including inside ComfyUI graphs, which store them as
-`\uXXXX` escapes.
+Searches ignore case, and an accented letter matches however the file
+encoded it (`café` typed in a terminal finds a composed or decomposed `é`;
+`cafe` without the accent doesn't). Chinese, Japanese, Korean and emoji work
+everywhere, including inside ComfyUI graphs, which store them as `\uXXXX`
+escapes.
 
 | Option | What it does |
 |---|---|
@@ -170,12 +171,18 @@ search-image-meta /Volumes/Photos "krea" -r --results ~/krea_results.txt
 
 - `--index FILE` stores the extracted metadata in SQLite, keyed by path, size
   and modification time. It serves any later search, whatever the terms or
-  options. Delete the file to start over.
+  options. It pays off when reading files is the slow part — network shares,
+  USB drives, the first search after a reboot — and saves little on a fast
+  local disk whose files the system has already cached. The file is large
+  (roughly 12 KB per ComfyUI image); delete it to start over.
 - `--results FILE` records settings, finished folders and matches; rerunning
   with the same settings skips finished folders (`--no-resume` to start fresh).
-- `-j N` sets the number of workers (default: twice the CPU count, up to 32).
-  The default thread pool suits network and external drives; `--pool process`
-  suits large local PSD / TIFF files.
+- `--pool process` spreads the work over every CPU core and is usually the
+  fastest for big searches: on 55,000 ComfyUI images it took 14 s against 26 s
+  with the default thread pool, and 13 s against 42 s for a search with
+  accented or Chinese terms. The thread pool starts instantly, which suits
+  small folders. `-j N` sets the number of workers (default: twice the CPU
+  count, up to 32).
 - `--progress never` and `--no-count` keep the output quiet and skip the
   counting pass.
 
