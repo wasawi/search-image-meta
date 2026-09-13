@@ -185,6 +185,23 @@ ComfyUI's WebP / AVIF images, get all of the above.
 The exit status is 0 when something matched and 1 when nothing did, so it
 works in scripts: `search-image-meta ~/output "krea" -r > /dev/null && echo found`.
 
+## Finding broken files
+
+```bash
+# which files can't be read at all, and what they seem to contain
+search-image-meta ~/ComfyUI/output -r --broken -v
+
+# links to all of them in one folder, named after where they came from
+search-image-meta ~/ComfyUI/output -r --broken --link-dir ~/broken --flatten path
+```
+
+`--broken` lists unreadable files instead of searching, with a hint from each
+file's size and first bytes: an empty file, only zero bytes, a damaged or
+cut-off PNG / JPEG / WebP, a HEIC or video container, HTML or JSON text saved
+with an image name, … The summary counts each kind. For thousands of files
+prefer symlinks (the default) over `--link-type alias`, which makes one Finder
+alias at a time.
+
 ## Collecting matches
 
 ```bash

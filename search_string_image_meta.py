@@ -84,6 +84,9 @@ Examples
     # real copies named by their relative path (a/b/img.png -> a__b__img.png)
     python3 search_string_image_meta.py ~/output "Krea" -r --link-dir ~/matches --link-type copy --flatten path
 
+    # which files can't be read, and what's in them; symlinks to look at them
+    python3 search_string_image_meta.py ~/output -r --broken -v --link-dir ~/broken --flatten path
+
     # thorough pass: late PNG chunks and deep XMP, and list unreadable files
     python3 search_string_image_meta.py ~/Pictures "Barcelona" -r --deep --errors
 
@@ -1373,6 +1376,66 @@ def _snippet(text: str, match: re.Match) -> str:
     return ("…" if start else "") + out + ("…" if end < len(text) else "")
 
 
+_DAMAGED_SIGNATURES = (
+    (bytes([0x89]) + b"PNG\r\n\x1a\n", "PNG, damaged or cut short"),
+    (bytes([0xFF, 0xD8, 0xFF]), "JPEG, damaged or cut short"),
+    (b"GIF8", "GIF, damaged or cut short"),
+)
+
+
+def _human_size(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def describe_unreadable(path: str) -> str:
+    """What an unreadable file seems to hold: "category; details; size".
+
+    Judged from its size and first bytes, for --broken and --errors.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return ""
+    details = ""
+    if size == 0:
+        category = "empty file"
+    elif not head.strip(b"\x00"):
+        category = "only zero bytes (never finished writing?)"
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        category = "WebP, damaged or cut short"
+    elif head[4:8] == b"ftyp":
+        category = "HEIC / AVIF / video container"
+        details = "brand " + head[8:12].decode("latin-1", "replace").strip()
+    else:
+        category = next((name for magic, name in _DAMAGED_SIGNATURES
+                         if head.startswith(magic)), "")
+        text = head.lstrip()
+        if category:
+            pass
+        elif text[:1] == b"<":
+            category = "HTML or XML text (an error page saved as an image?)"
+        elif text[:1] in (b"{", b"["):
+            category = "JSON text"
+        elif all(32 <= b < 127 or b in (9, 10, 13) for b in head):
+            category = "plain text"
+        else:
+            category = "unrecognised content"
+            details = "starts " + head[:8].hex(" ")
+    return "; ".join(part for part in (category, details, _human_size(size)) if part)
+
+
+def _broken_reason(error: str) -> str:
+    """The category part of an error's [hint], for the --broken summary."""
+    hint = re.search(r"\[([^\];]+)", error)
+    return hint.group(1) if hint else "unreadable"
+
+
 def scan_one(path_str: str):
     """Worker: (path, [(field, snippet)], error, summary, index record).
 
@@ -1398,7 +1461,12 @@ def scan_one(path_str: str):
         errno = getattr(exc, "errno", None)
         if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
             kind = "TooManyOpenFiles"
-        return path_str, [], f"{kind}: {exc}", None, None
+        message = str(exc).replace(repr(path_str), "").replace(path_str, "")
+        hint = "" if kind == "TooManyOpenFiles" else describe_unreadable(path_str)
+        return (path_str, [], f"{kind}: {message.strip(' :')}"
+                + (f" [{hint}]" if hint else ""), None, None)
+    if cfg.get("broken"):
+        return path_str, [], None, None, record  # readable, so not broken
 
     rxs, only = cfg["rx"], cfg["fields"]
     units = []
@@ -1834,6 +1902,7 @@ class ResultsFile:
                         "case_sensitive", "recursive", "ext", "fields",
                         "hidden", "follow_symlinks", "only_connected",
                         "exclude", "node_types", "inputs", "saved_prompts",
+                        "broken",
                         "exclude_dirs", "since", "until"):
                 if key in params:
                     self._comment(f"{key}: {params[key]}")
@@ -2100,7 +2169,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("folder", type=Path, help="folder to search")
-    ap.add_argument("patterns", nargs="+", metavar="PATTERN",
+    ap.add_argument("patterns", nargs="*", metavar="PATTERN",
                     help="string(s) to look for (regex with --regex). Give "
                          "several and all of them must match, unless --any")
     ap.add_argument("--any", action="store_const", const="any", default="all",
@@ -2233,12 +2302,21 @@ def parse_args(argv=None):
                              "xargs -0")
     ap.add_argument("--errors", action="store_true",
                     help="report unreadable files on stderr")
+    ap.add_argument("--broken", action="store_true",
+                    help="instead of searching, list the files that can't be "
+                         "read, with a hint of what they contain (-v shows "
+                         "it per file). Takes no patterns; works with "
+                         "--link-dir, --json, --csv, -0 and --results")
     return ap.parse_args(argv)
 
 
 def main(argv=None) -> int:
     _setup_stdio()
     args = parse_args(argv)
+    if args.broken and args.patterns:
+        return _die("--broken lists unreadable files and takes no search patterns")
+    if not args.broken and not args.patterns:
+        return _die("give at least one pattern to search for (or use --broken)")
 
     root = args.folder.expanduser().resolve()
     if not root.is_dir():
@@ -2305,6 +2383,8 @@ def main(argv=None) -> int:
             params["inputs"] = args.inputs
         if args.saved_prompts is not None:
             params["saved_prompts"] = sorted(args.saved_prompts) or ["all"]
+        if args.broken:
+            params["broken"] = True
         for key in ("exclude_dirs", "since", "until"):
             if getattr(args, key):
                 params[key] = getattr(args, key)
@@ -2370,7 +2450,7 @@ def main(argv=None) -> int:
         "mode": args.match, "scope": args.scope, "connected": connected,
         "node_types": args.node_types, "inputs": args.inputs,
         "show": args.show, "index": str(index.path) if index else None,
-        "saved_prompts": args.saved_prompts,
+        "saved_prompts": args.saved_prompts, "broken": args.broken,
     },)
 
     scanned = found = errors = 0
@@ -2388,6 +2468,7 @@ def main(argv=None) -> int:
     sealed: set[str] = set()           # walker has emitted all files for dir
     dirty: set[str] = set()            # dir had a read failure this run
     error_kinds: dict[str, int] = {}   # error type -> count
+    broken_reasons: dict[str, int] = {}  # --broken: what the files hold
 
     def finish_dir(dirpath: str) -> None:
         if dirpath not in sealed or outstanding.get(dirpath, 0) != 0:
@@ -2415,6 +2496,12 @@ def main(argv=None) -> int:
             index.add(path_str, *record[:2], args.deep, record[2])
         outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
 
+        if error and args.broken:
+            # --broken: the unreadable files are the results
+            reason = _broken_reason(error)
+            broken_reasons[reason] = broken_reasons.get(reason, 0) + 1
+            hits = [("error", error)]
+            error = None
         if error:
             errors += 1
             kind = error.split(":", 1)[0]
@@ -2554,11 +2641,15 @@ def main(argv=None) -> int:
              "resumed": bool(log and log.resumed),
              "interrupted": interrupted,
              "error_kinds": error_kinds,
+             "broken_reasons": broken_reasons,
              "results": results},
             indent=2, ensure_ascii=False,
         ))
     else:
-        summary = f"\n{found} match(es) in {scanned} image(s) scanned"
+        noun = "broken file(s)" if args.broken else "match(es)"
+        summary = f"\n{found} {noun} in {scanned} image(s) scanned"
+        for reason, count in sorted(broken_reasons.items(), key=lambda kv: -kv[1]):
+            summary += f"\n  {count:,} × {reason}"
         if errors:
             summary += f", {errors} unreadable"
             top = sorted(error_kinds.items(), key=lambda kv: -kv[1])[:3]
