@@ -71,6 +71,9 @@ Examples
     python3 search_string_image_meta.py /Volumes/Photos "Krea" -r --results ~/krea_results.txt
     python3 search_string_image_meta.py /Volumes/Photos "Krea" -r --results ~/krea_results.txt --no-resume
 
+    # cache what was read; every later search of that drive only reads new files
+    python3 search_string_image_meta.py /Volumes/Photos "Krea" -r --index ~/data_meta.sqlite
+
     # real copies named by their relative path (a/b/img.png -> a__b__img.png)
     python3 search_string_image_meta.py ~/output "Krea" -r --link-dir ~/matches --link-type copy --flatten path
 
@@ -93,11 +96,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import warnings
+import zlib
 from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
                                 ThreadPoolExecutor, wait)
 from datetime import datetime, timedelta
@@ -838,6 +844,87 @@ def prepare_text(text: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# metadata index (--index)
+# --------------------------------------------------------------------------
+#
+# A SQLite file remembering what extract_metadata() found in each file, keyed
+# by path, size and modification time. Workers read it, each thread or
+# process on its own connection; only the parent writes, in batches.
+
+INDEX_VERSION = "1"  # bump whenever extraction changes, to re-read every file
+_INDEX_LOCAL = threading.local()
+
+
+class MetadataIndex:
+    """The parent's side of --index: schema, counters and batched writes."""
+
+    BATCH = 256
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.cached = self.read = 0
+        self.rebuilt = False
+        self._pending: list = []
+        self._db = sqlite3.connect(str(path), timeout=60)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("CREATE TABLE IF NOT EXISTS info "
+                         "(key TEXT PRIMARY KEY, value TEXT)")
+        self._db.execute("CREATE TABLE IF NOT EXISTS files ("
+                         "path TEXT PRIMARY KEY, size INTEGER NOT NULL, "
+                         "mtime_ns INTEGER NOT NULL, deep INTEGER NOT NULL, "
+                         "meta BLOB NOT NULL)")
+        row = self._db.execute(
+            "SELECT value FROM info WHERE key = 'version'").fetchone()
+        if row is None or row[0] != INDEX_VERSION:
+            self.rebuilt = row is not None
+            self._db.execute("DELETE FROM files")
+            self._db.execute("INSERT OR REPLACE INTO info VALUES ('version', ?)",
+                             (INDEX_VERSION,))
+        self._db.commit()
+
+    def add(self, path: str, size: int, mtime_ns: int, deep: bool,
+            meta: dict) -> None:
+        blob = zlib.compress(json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+        self._pending.append((path, size, mtime_ns, int(deep), blob))
+        self.read += 1
+        if len(self._pending) >= self.BATCH:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._pending:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?)",
+                self._pending)
+            self._db.commit()
+            self._pending.clear()
+
+    def close(self) -> None:
+        self.flush()
+        self._db.close()
+
+
+def index_lookup(index_path: str, path: str, size: int, mtime_ns: int,
+                 deep: bool):
+    """Cached metadata for a file that hasn't changed, else None (workers)."""
+    connections = getattr(_INDEX_LOCAL, "connections", None)
+    if connections is None:
+        connections = _INDEX_LOCAL.connections = {}
+    try:
+        db = connections.get(index_path)
+        if db is None:
+            db = connections[index_path] = sqlite3.connect(index_path,
+                                                           timeout=60)
+        row = db.execute("SELECT deep, meta FROM files "
+                         "WHERE path = ? AND size = ? AND mtime_ns = ?",
+                         (path, size, mtime_ns)).fetchone()
+    except sqlite3.Error:
+        return None  # a busy or damaged index just means reading the file
+    if row is None or (deep and not row[0]):
+        return None  # a --deep search can't use a shallow read
+    return json.loads(zlib.decompress(row[1]).decode("utf-8"))
+
+
+# --------------------------------------------------------------------------
 # parallel scanning
 # --------------------------------------------------------------------------
 
@@ -876,16 +963,30 @@ def _snippet(text: str, match: re.Match) -> str:
 
 
 def scan_one(path_str: str):
-    """Worker: (path, [(field, snippet)], error or None, summary or None)."""
-    path = Path(path_str)
+    """Worker: (path, [(field, snippet)], error, summary, index record).
+
+    The index record is None without --index, "cached" when the metadata
+    came from it, or (size, mtime_ns, metadata) for the parent to store.
+    """
+    deep, index_path = _CFG.get("deep", False), _CFG.get("index")
+    record = None
     try:
-        meta = extract_metadata(path, deep=_CFG.get("deep", False))
+        meta = None
+        if index_path:
+            st = os.stat(path_str)
+            meta = index_lookup(index_path, path_str, st.st_size,
+                                st.st_mtime_ns, deep)
+            record = "cached" if meta is not None else None
+        if meta is None:
+            meta = extract_metadata(Path(path_str), deep=deep)
+            if index_path:
+                record = (st.st_size, st.st_mtime_ns, meta)
     except Exception as exc:
         kind = type(exc).__name__
         errno = getattr(exc, "errno", None)
         if errno in (23, 24):  # ENFILE / EMFILE — a limit, not a bad file
             kind = "TooManyOpenFiles"
-        return path_str, [], f"{kind}: {exc}", None
+        return path_str, [], f"{kind}: {exc}", None, None
 
     rxs, only = _CFG["rx"], _CFG["fields"]
     units = []
@@ -900,7 +1001,7 @@ def scan_one(path_str: str):
     if hits and any(n.search(text) for _, text in units for n in _CFG["not_rx"]):
         hits = []  # --not: an excluded term turned up
     summary = summarize(meta) if hits and _CFG.get("show") else None
-    return path_str, hits, None, summary
+    return path_str, hits, None, summary, record
 
 
 def match_units(units, rxs, mode: str, scope: str, want_snippets: bool) -> list:
@@ -1490,6 +1591,11 @@ def parse_args(argv=None):
     ap.add_argument("--no-resume", action="store_true",
                     help="with --results: start the file fresh instead of "
                          "resuming from it")
+    ap.add_argument("--index", type=Path, metavar="FILE",
+                    help="remember what was read from every file in this "
+                         "SQLite file; later searches (any pattern, any "
+                         "option) skip files that haven't changed. Delete it "
+                         "to start over")
     ap.add_argument("--progress", default="auto", choices=["auto", "always", "never"],
                     help="progress bar on stderr (default: auto = only on a terminal)")
     ap.add_argument("--no-count", action="store_true",
@@ -1592,6 +1698,13 @@ def main(argv=None) -> int:
                   f"done, {log.prior_hits:,} match(es) on record",
                   file=sys.stderr)
 
+    index = None
+    if args.index:
+        try:
+            index = MetadataIndex(args.index.expanduser().resolve())
+        except (sqlite3.Error, OSError) as exc:
+            return _die(f"cannot open index {args.index}: {exc}")
+
     skip_dirs = log.completed_dirs if log else frozenset()
 
     workers = args.workers or min(32, (os.cpu_count() or 4) * 2)
@@ -1627,7 +1740,7 @@ def main(argv=None) -> int:
         "deep": args.deep,
         "mode": args.match, "scope": args.scope, "connected": connected,
         "node_types": args.node_types, "inputs": args.inputs,
-        "show": args.show,
+        "show": args.show, "index": str(index.path) if index else None,
     },)
 
     scanned = found = errors = 0
@@ -1663,9 +1776,13 @@ def main(argv=None) -> int:
         sealed.add(dirpath)
         finish_dir(dirpath)
 
-    def handle(path_str, hits, error, summary, dirpath):
+    def handle(path_str, hits, error, summary, record, dirpath):
         nonlocal scanned, found, errors
         scanned += 1
+        if record == "cached":
+            index.cached += 1
+        elif record is not None:
+            index.add(path_str, *record[:2], args.deep, record[2])
         outstanding[dirpath] = outstanding.get(dirpath, 1) - 1
 
         if error:
@@ -1781,6 +1898,8 @@ def main(argv=None) -> int:
               file=sys.stderr)
 
     bar.finish()
+    if index:
+        index.close()
 
     if log:
         log.close(scanned, found, errors,
@@ -1792,6 +1911,9 @@ def main(argv=None) -> int:
              "root": str(root), "recursive": args.recursive,
              "link_dir": str(dest_dir) if dest_dir else None,
              "results_file": str(log.path) if log else None,
+             "index": ({"path": str(index.path), "cached": index.cached,
+                        "read": index.read, "rebuilt": index.rebuilt}
+                       if index else None),
              "resumed": bool(log and log.resumed),
              "interrupted": interrupted,
              "error_kinds": error_kinds,
@@ -1811,6 +1933,10 @@ def main(argv=None) -> int:
             summary += "\n  (rerun to retry them; use --errors to list them)"
         if dest_dir:
             summary += f"\nlinks in: {dest_dir}"
+        if index:
+            summary += (f"\nindex:    {index.cached:,} from cache, "
+                        f"{index.read:,} read"
+                        + (" (rebuilt for a new version)" if index.rebuilt else ""))
         if log:
             summary += f"\nresults:  {log.path}"
         print(summary, file=sys.stderr)
