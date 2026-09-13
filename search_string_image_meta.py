@@ -2,8 +2,9 @@
 """
 search_string_image_meta.py — search image metadata for a string, in parallel.
 
-Searches EXIF (incl. nested Exif/GPS IFDs), XMP, IPTC/APP13, JPEG comments
-and PNG tEXt/iTXt chunks (ComfyUI `prompt` / `workflow` / `parameters`).
+Searches EXIF (incl. nested Exif/GPS IFDs), XMP, IPTC/APP13, JPEG comments,
+PNG tEXt/iTXt chunks (ComfyUI `prompt` / `workflow` / `parameters`) and the
+metadata of MP4 / MOV / WebM / MKV videos (ComfyUI, VideoHelperSuite).
 
 Prints the full path of every matching image, and can optionally place a
 link/alias to each match in a separate folder.
@@ -152,11 +153,12 @@ def raise_fd_limit(desired: int) -> int:
             continue
     return soft
 
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 DEFAULT_EXTS = {
     ".jpg", ".jpeg", ".jpe", ".png", ".gif", ".tif", ".tiff", ".webp",
     ".bmp", ".heic", ".heif", ".avif", ".jp2", ".dng", ".cr2", ".nef",
     ".arw", ".orf", ".rw2", ".raf", ".psd", ".ico",
-}
+} | VIDEO_EXTS
 
 TAGS = ExifTags.TAGS
 GPSTAGS = ExifTags.GPSTAGS
@@ -264,6 +266,226 @@ def _xmp_from_bytes(path: Path, limit: int = 4_000_000) -> str:
     return blob[start:end].decode("utf-8", errors="ignore")
 
 
+# --------------------------------------------------------------------------
+# video containers (MP4 / MOV, WebM / MKV)
+# --------------------------------------------------------------------------
+#
+# ComfyUI's SaveVideo / SaveWEBM store `prompt` and `workflow` as container
+# metadata (MP4 "mdta" keys, Matroska tags); VideoHelperSuite puts both into
+# one JSON `comment`. Only the metadata is read: boxes and elements are
+# skipped by their size, so the video data itself is never loaded.
+
+_META_LIMIT = 64 * 1024 * 1024  # never load a metadata block bigger than this
+_MP4_FIRST_BOXES = {b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide",
+                    b"pnot", b"uuid"}
+_MP4_ITEM_NAMES = {"\xa9cmt": "comment", "\xa9nam": "title",
+                   "\xa9too": "encoder", "\xa9day": "date", "\xa9ART": "artist",
+                   "desc": "description"}
+_EBML_HEADER, _MKV_SEGMENT, _MKV_TAGS = 0x1A45DFA3, 0x18538067, 0x1254C367
+_MKV_TAG, _MKV_SIMPLE_TAG = 0x7373, 0x67C8
+_MKV_TAG_NAME, _MKV_TAG_STRING = 0x45A3, 0x4487
+
+
+def _iter_boxes(buf: bytes, start: int, end: int):
+    """(type, body start, end) of the ISO-BMFF boxes in buf[start:end]."""
+    pos = start
+    while pos + 8 <= end:
+        size, kind, header = int.from_bytes(buf[pos:pos + 4], "big"), buf[pos + 4:pos + 8], 8
+        if size == 1:
+            size, header = int.from_bytes(buf[pos + 8:pos + 16], "big"), 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            return
+        yield kind, pos + header, pos + size
+        pos += size
+
+
+def _mp4_moov(path: Path):
+    """The moov box of an MP4 / MOV, found by hopping over top-level boxes."""
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        pos, first = 0, True
+        while pos + 8 <= size:
+            fh.seek(pos)
+            header = fh.read(16)
+            box, kind, offset = int.from_bytes(header[:4], "big"), header[4:8], 8
+            if first and kind not in _MP4_FIRST_BOXES:
+                raise ValueError("not an MP4/MOV container")
+            first = False
+            if box == 1:
+                box, offset = int.from_bytes(header[8:16], "big"), 16
+            elif box == 0:
+                box = size - pos
+            if box < offset:
+                raise ValueError("damaged MP4/MOV box")
+            if kind == b"moov":
+                if box > _META_LIMIT:
+                    return b""
+                fh.seek(pos + offset)
+                return fh.read(box - offset)
+            pos += box
+    return b""
+
+
+def _mp4_metadata(path: Path) -> dict:
+    moov = _mp4_moov(path)
+    fields: dict = {}
+
+    def read_meta(start: int, end: int) -> None:
+        # ISO "meta" is a full box (4 bytes of version/flags); QuickTime's isn't
+        skip = 0 if moov[start + 4:start + 8] == b"hdlr" else 4
+        children = list(_iter_boxes(moov, start + skip, end))
+        keys = []
+        for kind, body, stop in children:
+            if kind == b"keys":
+                pos = body + 8  # version/flags, entry count
+                while pos + 8 <= stop:
+                    size = int.from_bytes(moov[pos:pos + 4], "big")
+                    if size < 8:
+                        break
+                    keys.append(moov[pos + 8:pos + size].decode("utf-8", "replace"))
+                    pos += size
+        for kind, body, stop in children:
+            if kind != b"ilst":
+                continue
+            for item, item_body, item_end in _iter_boxes(moov, body, stop):
+                number = int.from_bytes(item, "big")
+                if 1 <= number <= len(keys):
+                    name = keys[number - 1]
+                else:
+                    tag = item.decode("latin-1")
+                    name = _MP4_ITEM_NAMES.get(tag, tag)
+                for data, data_body, data_end in _iter_boxes(moov, item_body, item_end):
+                    if data == b"data":  # 4 bytes type, 4 bytes locale
+                        fields.setdefault(name, _decode_bytes(moov[data_body + 8:data_end]))
+
+    def walk(start: int, end: int) -> None:
+        for kind, body, stop in _iter_boxes(moov, start, end):
+            if kind == b"udta":
+                walk(body, stop)
+            elif kind == b"meta":
+                read_meta(body, stop)
+
+    walk(0, len(moov))
+    return fields
+
+
+def _ebml_number(read, keep_marker: bool):
+    """An EBML variable-length number from read(n); None if unknown or EOF."""
+    first = read(1)
+    if not first:
+        return None, 0
+    length, mask = 1, 0x80
+    while length <= 8 and not first[0] & mask:
+        length, mask = length + 1, mask >> 1
+    if length > 8:
+        raise ValueError("damaged Matroska element")
+    rest = read(length - 1)
+    if len(rest) < length - 1:
+        return None, 0
+    value = first[0] if keep_marker else first[0] & (mask - 1)
+    for byte in rest:
+        value = (value << 8) | byte
+    if not keep_marker and value == (1 << (7 * length)) - 1:
+        return None, length  # "unknown size"
+    return value, length
+
+
+def _ebml_children(buf: bytes, start: int, end: int):
+    pos = start
+    while pos < end:
+        view = memoryview(buf)
+        cursor = [pos]
+
+        def read(n):
+            chunk = bytes(view[cursor[0]:cursor[0] + n])
+            cursor[0] += n
+            return chunk
+
+        eid, _ = _ebml_number(read, True)
+        size, _ = _ebml_number(read, False)
+        body = cursor[0]
+        if eid is None or size is None or body + size > end:
+            return
+        yield eid, body, body + size
+        pos = body + size
+
+
+def _mkv_metadata(path: Path) -> dict:
+    fields: dict = {}
+    size = path.stat().st_size
+    with open(path, "rb") as fh:
+        if _ebml_number(fh.read, True)[0] != _EBML_HEADER:
+            raise ValueError("not a WebM/MKV container")
+        header_size, _ = _ebml_number(fh.read, False)
+        fh.seek(header_size or 0, 1)
+        if _ebml_number(fh.read, True)[0] != _MKV_SEGMENT:
+            return fields
+        segment, _ = _ebml_number(fh.read, False)
+        end = size if segment is None else min(size, fh.tell() + segment)
+        while fh.tell() < end:
+            eid, _ = _ebml_number(fh.read, True)
+            length, _ = _ebml_number(fh.read, False)
+            if eid is None or length is None:
+                break  # an unknown-size element can't be skipped
+            body = fh.tell()
+            if eid == _MKV_TAGS and length <= _META_LIMIT:
+                buf = fh.read(length)
+
+                def simple_tag(start, stop):
+                    name = value = None
+                    for cid, cstart, cstop in _ebml_children(buf, start, stop):
+                        if cid == _MKV_TAG_NAME:
+                            name = buf[cstart:cstop].decode("utf-8", "replace")
+                        elif cid == _MKV_TAG_STRING:
+                            value = buf[cstart:cstop].decode("utf-8", "replace")
+                        elif cid == _MKV_SIMPLE_TAG:
+                            simple_tag(cstart, cstop)
+                    if name and value is not None:
+                        fields.setdefault(name.lower(), value.rstrip("\x00"))
+
+                for tid, tstart, tstop in _ebml_children(buf, 0, len(buf)):
+                    if tid == _MKV_TAG:
+                        for cid, cstart, cstop in _ebml_children(buf, tstart, tstop):
+                            if cid == _MKV_SIMPLE_TAG:
+                                simple_tag(cstart, cstop)
+            fh.seek(body + length)
+    return fields
+
+
+def extract_video_metadata(path: Path) -> dict:
+    """Container metadata of an MP4 / MOV or WebM / MKV file, {name: text}."""
+    if path.suffix.lower() in (".webm", ".mkv"):
+        fields = _mkv_metadata(path)
+    else:
+        fields = _mp4_metadata(path)
+    # VideoHelperSuite: one JSON comment carrying both prompt and workflow
+    for name, text in list(fields.items()):
+        text = text.strip()
+        if not text.startswith("{") or ('"prompt"' not in text
+                                        and '"workflow"' not in text):
+            continue
+        try:
+            data = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        split = False
+        for key in ("prompt", "workflow"):
+            value = data.get(key)
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value)
+            if isinstance(value, str) and key not in fields:
+                fields[key] = value
+                split = True
+        if split:
+            # searching the combined copy too would bypass the graph filters
+            del fields[name]
+    return fields
+
+
 def extract_metadata(path: Path, deep: bool = False) -> dict:
     """Return {field_name: text} for everything we can read out of the image.
 
@@ -272,6 +494,8 @@ def extract_metadata(path: Path, deep: bool = False) -> dict:
     extras — PNG text chunks written *after* the image data, and XMP packets
     hiding further into the file than the header.
     """
+    if path.suffix.lower() in VIDEO_EXTS:
+        return extract_video_metadata(path)
     fields: dict[str, str] = {}
     try:
         with Image.open(path) as img:
