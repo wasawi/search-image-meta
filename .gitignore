@@ -1,0 +1,13 @@
+# local environments and caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# generated test images
+samples/
+
+# private files that stay out of the repo
+*.ORIGINAL.py
+Krea2_turbo_00001_.png
