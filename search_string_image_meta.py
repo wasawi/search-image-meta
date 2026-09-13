@@ -98,9 +98,11 @@ import csv
 import fnmatch
 import io
 import json
+import multiprocessing
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1315,6 +1317,11 @@ def _worker_init(opts: dict):
     cfg["fields"] = ({f.lower() for f in opts["fields"]}
                      if opts["fields"] else None)
 
+    if multiprocessing.parent_process() is not None:
+        # A process-pool worker. Ctrl-C reaches the whole process group; only
+        # the parent should act on it (it cancels the work and stops workers).
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # Thread-pool workers share this module and each runs this as it starts,
     # possibly while another is mid-scan: swap in a whole new config instead
     # of changing the one in use (scan_one holds on to the one it began with)
@@ -1900,8 +1907,9 @@ def _make_finder_alias(src: Path, dest_dir: Path, name: str) -> Path:
         f'  set name of newAlias to {_applescript_string(target.name)}\n'
         'end tell'
     )
+    # a permission dialog nobody sees would otherwise block forever
     subprocess.run(["osascript", "-e", script],
-                   check=True, capture_output=True, text=True)
+                   check=True, capture_output=True, text=True, timeout=60)
     return target
 
 
@@ -1920,7 +1928,8 @@ def _make_windows_shortcut(src: Path, dest_dir: Path, name: str) -> Path:
               f".CreateShortcut({quoted(target)}); "
               f"$s.TargetPath = {quoted(src)}; $s.Save()")
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                    script], check=True, capture_output=True, text=True)
+                    script], check=True, capture_output=True, text=True,
+                   timeout=60)
     return target
 
 
@@ -2027,6 +2036,22 @@ def _ansi_terminal(stream) -> bool:
         return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
     except Exception:
         return False
+
+
+def _abandon_pool(pool) -> None:
+    """Stop a pool after Ctrl-C without waiting for work stuck on a slow disk.
+
+    Queued jobs are cancelled and process workers terminated. Threads can't
+    be stopped, so cli() leaves with os._exit once results are saved.
+    """
+    # shutdown() forgets the worker processes, so collect them first
+    workers = list((getattr(pool, "_processes", None) or {}).values())
+    pool.shutdown(wait=False, cancel_futures=True)
+    for process in workers:
+        try:
+            process.terminate()
+        except Exception:
+            pass
 
 
 def _die(msg: str) -> int:
@@ -2423,6 +2448,7 @@ def main(argv=None) -> int:
         bar.draw(force=True)
         finish_dir(dirpath)
 
+    pool = None
     try:
         if workers == 1:
             _worker_init(*init_args)
@@ -2435,37 +2461,42 @@ def main(argv=None) -> int:
         else:
             pool_cls = (ThreadPoolExecutor if args.pool == "thread"
                         else ProcessPoolExecutor)
-            with pool_cls(max_workers=workers,
-                          initializer=_worker_init,
-                          initargs=init_args) as pool:
-                futures: dict = {}          # future -> dirpath
-                queue_cap = workers * 8     # keep memory flat on huge trees
-                exhausted = False
-                while True:
-                    while not exhausted and len(futures) < queue_cap:
-                        try:
-                            kind, dirpath, path_str = next(paths)
-                        except StopIteration:
-                            exhausted = True
-                            break
-                        if kind == "seal":
-                            seal(dirpath)
-                            continue
-                        outstanding[dirpath] = outstanding.get(dirpath, 0) + 1
-                        futures[pool.submit(scan_one, path_str)] = dirpath
-                    if not futures:
+            pool = pool_cls(max_workers=workers, initializer=_worker_init,
+                            initargs=init_args)
+            futures: dict = {}          # future -> dirpath
+            queue_cap = workers * 8     # keep memory flat on huge trees
+            exhausted = False
+            while True:
+                while not exhausted and len(futures) < queue_cap:
+                    try:
+                        kind, dirpath, path_str = next(paths)
+                    except StopIteration:
+                        exhausted = True
                         break
-                    # handle everything that finished, not just the first one:
-                    # each wait() registers a callback on every pending future,
-                    # so draining the batch amortises that over the whole round
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    for fut in done:
-                        handle(*fut.result(), futures.pop(fut))
+                    if kind == "seal":
+                        seal(dirpath)
+                        continue
+                    outstanding[dirpath] = outstanding.get(dirpath, 0) + 1
+                    futures[pool.submit(scan_one, path_str)] = dirpath
+                if not futures:
+                    break
+                # handle everything that finished, not just the first one:
+                # each wait() registers a callback on every pending future,
+                # so draining the batch amortises that over the whole round
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    handle(*fut.result(), futures.pop(fut))
+            pool.shutdown()
     except KeyboardInterrupt:
         interrupted = True
         bar.clear()
         print("interrupted — progress saved" if log else "interrupted",
               file=sys.stderr)
+    finally:
+        if pool is not None and interrupted:
+            _abandon_pool(pool)
+        elif pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)  # after an error
 
     bar.finish()
     if index:
@@ -2519,10 +2550,21 @@ def main(argv=None) -> int:
 def cli() -> None:
     """Console-script entry point."""
     try:
-        sys.exit(main())
+        code = main()
     except KeyboardInterrupt:
         sys.stderr.write("\r\x1b[2Kinterrupted\n")
-        sys.exit(130)
+        code = 130
+    if code == 130:
+        # Workers may still be blocked on a slow disk and threads can't be
+        # stopped; Python would wait for them at exit. Results and the index
+        # are already saved, so leave now.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(130)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
