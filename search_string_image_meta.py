@@ -76,6 +76,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import warnings
 from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
                                 ThreadPoolExecutor, wait)
@@ -165,6 +166,21 @@ def _decode_bytes(raw: bytes) -> str:
     return raw.decode("utf-8", errors="ignore") or raw.decode("latin-1", "ignore")
 
 
+def _latin1_as_utf8(text: str) -> str:
+    """Undo Pillow reading UTF-8 bytes in a PNG tEXt chunk as Latin-1.
+
+    tEXt is Latin-1 by the spec, but plenty of tools write UTF-8 into it.
+    Genuine Latin-1 ("café") is almost never valid UTF-8 once re-encoded, and
+    real iTXt text doesn't fit in Latin-1 at all, so both pass through.
+    """
+    if text.isascii():
+        return text
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return text
+
+
 def _stringify(value) -> str:
     """Turn any metadata value into something searchable."""
     if isinstance(value, (bytes, bytearray)):
@@ -241,7 +257,8 @@ def extract_metadata(path: Path, deep: bool = False) -> dict:
             for key, value in info.items():
                 if key in ("icc_profile", "exif", "photoshop", "adobe"):
                     continue  # binary; parsed properly below
-                fields[key] = _stringify(value)
+                text = _stringify(value)
+                fields[key] = _latin1_as_utf8(text) if fmt == "PNG" else text
 
             # PNG.getexif() decodes the ENTIRE image looking for a trailing
             # eXIf chunk — 50x the cost of everything else here. Only pay it
@@ -534,8 +551,9 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
     Normally that's the field itself. When it holds a ComfyUI graph:
       connected     drops the unconnected nodes first ("linked" / "output")
       scope "node"  makes each node its own unit, labelled "field#node"
-    What remains is re-serialised the way ComfyUI writes it (plain json.dumps),
-    so patterns written against the raw metadata keep matching. A filtered
+    What remains is re-serialised the way ComfyUI writes it (json.dumps, with
+    the real characters prepare_text() restored), so patterns written against
+    the raw metadata keep matching. A filtered
     workflow keeps only the kept nodes, their links and the subgraphs they
     use (not groups or canvas settings); with scope "node" only the nodes'
     own contents are searched.
@@ -564,11 +582,53 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
         data = (_connected_workflow(data, connected) if kind == "workflow"
                 else _connected_prompt(data, connected))
 
-    ascii_only = text.isascii()
     if scope == "node":
-        return [(f"{field}#{label}", json.dumps(node, ensure_ascii=ascii_only))
+        return [(f"{field}#{label}", json.dumps(node, ensure_ascii=False))
                 for label, node in _graph_nodes(data, kind)]
-    return [(field, head.group(0) + json.dumps(data, ensure_ascii=ascii_only))]
+    return [(field, head.group(0) + json.dumps(data, ensure_ascii=False))]
+
+
+# --------------------------------------------------------------------------
+# text normalisation
+# --------------------------------------------------------------------------
+#
+# ComfyUI (like anything using Python's json.dumps) writes every non-ASCII
+# character as a backslash-u escape, so 女孩 is stored as two hex codes and
+# é as one. Searching that text as-is would never find Chinese, Japanese,
+# accents or emoji, so JSON-looking fields get their escapes decoded first.
+
+_BACKSLASH_U = "\\" + "u"
+_JSON_START = re.compile(r"\s*(?:[A-Za-z_]\w*:)?\s*[\[{]")
+_JSON_ESCAPE = re.compile(
+    r"\\\\"                                                   # "\\" itself
+    r"|[\\]u([dD][89abAB][0-9a-fA-F]{2})[\\]u([dD][c-fC-F][0-9a-fA-F]{2})"
+    r"|[\\]u([0-9a-fA-F]{4})")
+
+
+def _unescape(m: re.Match) -> str:
+    if m.group(1):  # UTF-16 surrogate pair, e.g. an emoji
+        hi, lo = int(m.group(1), 16), int(m.group(2), 16)
+        return chr(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00))
+    if m.group(3):
+        code = int(m.group(3), 16)
+        # ASCII escapes (quotes, control characters) stay put so the JSON
+        # still parses; a lone surrogate isn't a character at all
+        if code >= 0x80 and not 0xD800 <= code <= 0xDFFF:
+            return chr(code)
+    return m.group(0)  # an escaped backslash is text, never an escape
+
+
+def prepare_text(text: str) -> str:
+    """Metadata text the way a person would type it into a search.
+
+    Decodes JSON unicode escapes and composes accents (NFC), so "café" typed
+    in a terminal matches however the file stored it.
+    """
+    if _BACKSLASH_U in text and _JSON_START.match(text):
+        text = _JSON_ESCAPE.sub(_unescape, text)
+    if not text.isascii():
+        text = unicodedata.normalize("NFC", text)
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -578,17 +638,21 @@ def search_units(field: str, text: str, rxs, mode: str, scope: str,
 _CFG: dict = {}  # per-worker state, set by _worker_init
 
 
-def _worker_init(patterns, use_regex, case_sensitive, fields, want_snippets,
-                 deep=False, mode="all", scope="image", connected=None):
-    flags = (0 if case_sensitive else re.IGNORECASE) | re.DOTALL
-    _CFG["rx"] = [re.compile(p if use_regex else re.escape(p), flags)
-                  for p in patterns]
-    _CFG["mode"] = mode
-    _CFG["scope"] = scope
-    _CFG["fields"] = {f.lower() for f in fields} if fields else None
-    _CFG["snippets"] = want_snippets
-    _CFG["deep"] = deep
-    _CFG["connected"] = connected  # None, "linked" or "output"
+def _worker_init(opts: dict):
+    """Set up a worker from the options main() collected.
+
+    patterns, regex, case_sensitive, fields, snippets, deep, mode ("all" /
+    "any"), scope ("image" / "field" / "node"), connected (None / "linked" /
+    "output").
+    """
+    flags = (0 if opts["case_sensitive"] else re.IGNORECASE) | re.DOTALL
+    _CFG.clear()
+    _CFG.update(opts)
+    _CFG["rx"] = [re.compile(p if opts["regex"] else re.escape(p), flags)
+                  for p in (unicodedata.normalize("NFC", p)
+                            for p in opts["patterns"])]
+    _CFG["fields"] = ({f.lower() for f in opts["fields"]}
+                      if opts["fields"] else None)
 
 
 def _snippet(text: str, match: re.Match) -> str:
@@ -616,8 +680,8 @@ def scan_one(path_str: str):
     fields = []
     for f, t in meta.items():
         if t and not (only and f.lower() not in only):
-            fields.extend(search_units(f, t, rxs, mode, scope,
-                                       _CFG.get("connected")))
+            fields.extend(search_units(f, prepare_text(t), rxs, mode, scope,
+                                       _CFG["connected"]))
 
     if scope in ("field", "node"):
         # every term has to turn up inside one and the same field (or node)
@@ -1236,9 +1300,12 @@ def main(argv=None) -> int:
 
     paths = paths_factory()
 
-    init_args = (args.patterns, args.regex, args.case_sensitive,
-                 args.fields, args.verbose or args.as_json, args.deep,
-                 args.match, args.scope, connected)
+    init_args = ({
+        "patterns": args.patterns, "regex": args.regex,
+        "case_sensitive": args.case_sensitive, "fields": args.fields,
+        "snippets": args.verbose or args.as_json, "deep": args.deep,
+        "mode": args.match, "scope": args.scope, "connected": connected,
+    },)
 
     scanned = found = errors = 0
     results = []
