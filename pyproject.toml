@@ -21,7 +21,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "av>=12"]
+heif = ["pillow-heif"]
+test = ["pytest>=7", "av>=12", "pillow-heif"]
 
 [project.scripts]
 search-image-meta = "search_string_image_meta:cli"

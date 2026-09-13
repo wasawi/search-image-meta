@@ -32,6 +32,10 @@ and install its only dependency, `pip install pillow`. Everything below works
 the same with `python3 search_string_image_meta.py` instead of
 `search-image-meta`.
 
+For HEIC / HEIF photos (iPhones), also install `pillow-heif`
+(`pipx install "search-image-meta[heif] @ git+https://github.com/wasawi/search-image-meta"`,
+or `pip install pillow-heif` next to the script).
+
 ## Searching
 
 ```bash

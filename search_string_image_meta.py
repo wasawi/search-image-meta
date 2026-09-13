@@ -128,6 +128,14 @@ except ImportError:
     HAVE_DEFUSEDXML = False
     warnings.filterwarnings("ignore", message=".*defusedxml.*")
 
+# HEIC / HEIF (iPhone photos) need the optional pillow-heif package; without
+# it those files are reported as unreadable.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 def raise_fd_limit(desired: int) -> int:
     """Lift RLIMIT_NOFILE as far as the OS allows. Returns the soft limit.
